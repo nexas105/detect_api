@@ -1,0 +1,106 @@
+# ---- Environment ----
+.env
+.env.*
+!.env.example
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+**/.venv/
+**/venv/
+**/env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# ---- Node / Next.js / Studio ----
+node_modules/
+.next/
+out/
+.yarn/cache/
+.yarn/install-state.gz
+.yarn/build-state.yml
+.yarn/unplugged/
+.pnp.*
+.turbo/
+.swc/
+*.tsbuildinfo
+next-env.d.ts
+.eslintcache
+.stylelintcache
+
+# ---- ML Models (uncompressed -- too large for git) ----
+*.onnx
+*.pt
+*.tar.xz
+*.tar.gz
+*.gz
+# Compressed models (.7z) ARE committed -- they're the download source
+!*.7z
+
+# ---- Storage / runtime data ----
+storage/
+api/storage/
+api/models/640m*
+api/models/erax*
+db/data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# ---- Logs ----
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
+.yarn-error.log
+
+# ---- IDE / Editors ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# ---- OS ----
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ---- Misc ----
+*.bak
+*.tmp
+*.temp
+*.orig
+*.rej
+
+# ---- Docker ----
+docker-compose.override.yml

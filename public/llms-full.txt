@@ -1,0 +1,513 @@
+# EroHub NSFW Detection API -- Full LLM Reference
+# Base URL: https://your-domain.com (or http://localhost:8000 for dev)
+# Auth: API key as Bearer token in Authorization header
+# All image endpoints accept multipart/form-data with field "file"
+# Box format: [x, y, width, height] (xywh) for all models
+# Max upload: 50MB images, 200MB videos (auth users), 10MB/50MB (demo)
+# Max video duration: 300s (auth unlimited, demo 30s)
+
+## Authentication
+All endpoints except /demo/*, /health, /models, /storage/* require:
+  Authorization: Bearer ehk_xxxxx
+
+API keys are validated against the auth service. Usage is logged per key.
+Demo endpoints use IP-based rate limiting instead of API keys.
+
+## Detection Models
+
+NudeNet (nudenet) -- YOLOv8m, 640m.onnx (98.7MB), 18 labels:
+  FEMALE_BREAST_EXPOSED, FEMALE_BREAST_COVERED,
+  FEMALE_GENITALIA_EXPOSED, FEMALE_GENITALIA_COVERED,
+  MALE_GENITALIA_EXPOSED, MALE_GENITALIA_COVERED,
+  BUTTOCKS_EXPOSED, BUTTOCKS_COVERED,
+  ANUS_EXPOSED, ANUS_COVERED,
+  BELLY_EXPOSED, BELLY_COVERED,
+  ARMPITS_EXPOSED, ARMPITS_COVERED,
+  FEET_EXPOSED, FEET_COVERED,
+  FACE_FEMALE, FACE_MALE
+  Default censor labels: FEMALE_BREAST_EXPOSED, FEMALE_GENITALIA_EXPOSED, MALE_GENITALIA_EXPOSED, BUTTOCKS_EXPOSED, ANUS_EXPOSED
+
+EraX (erax) -- YOLO11s (18.3MB), 5 labels:
+  NIPPLE, PENIS, VAGINA, ANUS, MAKE_LOVE
+  Default censor labels: NIPPLE, PENIS, VAGINA, ANUS
+
+CLIP (clip-vit-base-patch32, 350MB) -- used for sexiness scoring, age estimation, deepfake detection, clothing classification, embeddings, zero-shot tagging. Lazy-loaded on first use.
+
+## Error Format
+All errors return JSON: {"detail": "Human-readable error message"}
+Status codes:
+  400 -- Bad request (invalid image, no labels, unsupported format)
+  401 -- Unauthorized (missing or invalid API key)
+  404 -- Not found (image not found, no NSFW scenes)
+  413 -- Payload too large (file exceeds size limit)
+  429 -- Rate limited (demo IP limit exceeded)
+  503 -- Service unavailable (CLIP not loaded, demo service not ready)
+
+## Cache Behavior
+Endpoints /classify, /rateme, /moderate support caching.
+- Cache key: sha256(image_bytes) + model_version + endpoint
+- Cache is checked before ML inference. Pass ?no_cache=1 to bypass.
+- Response header X-Cache: HIT (from cache) or MISS (fresh inference)
+- Cache TTL: 30 days (configurable via CACHE_TTL_DAYS env)
+- Cache layers: Redis (if available) -> Database fallback
+
+## Rate Limiting
+Auth users: rate limits based on tenant plan (free/starter/business/enterprise).
+Demo users: IP-based, 10 images/hour, 1 archive/hour.
+3-tier implementation: Redis -> DB -> In-memory fallback.
+
+## Webhook Payloads
+Webhooks fire on classify, rateme, moderate events. HMAC-signed (SHA256).
+Retries: immediate, then 1m, 5m, 30m (max 4 attempts).
+Headers on webhook POST:
+  Content-Type: application/json
+  X-Webhook-Signature: sha256=<hmac_hex>
+  X-Webhook-Timestamp: <unix_timestamp>
+  X-Webhook-Event: detection.classify | detection.rateme | detection.moderate
+Payload:
+{
+  "event": "detection.classify",
+  "tenant_id": "uuid",
+  "timestamp": 1700000000,
+  "detection": { <full endpoint response> }
+}
+
+## Endpoints -- Authenticated
+
+### POST /classify
+Detect NSFW content in an image. Returns detection boxes + CLIP analysis.
+Content-Type: multipart/form-data
+Fields: file (required)
+Query params: model=nudenet|erax (default: nudenet), no_cache=0|1
+Response (200):
+{
+  "image_id": "20240101_120000_a1b2c3d4",
+  "model": "nudenet",
+  "detections": [
+    {
+      "label": "FEMALE_BREAST_EXPOSED",
+      "score": 0.9234,
+      "box": [120, 200, 80, 90],
+      "box_format": "xywh"
+    }
+  ],
+  "age": {
+    "estimated_age": 25.3,
+    "bracket": "young_adult",
+    "confidence": 0.4521,
+    "is_minor_risk": false,
+    "available": true
+  },
+  "deepfake": {
+    "fake_probability": 0.1234,
+    "is_likely_fake": false,
+    "verdict": "likely_real",
+    "available": true
+  },
+  "clothing": {
+    "clothing": "lingerie",
+    "exposure_level": 0.65,
+    "scores": {"formal":0.01, "casual":0.05, "swimwear":0.12, "lingerie":0.45, "dress":0.03, "sportswear":0.02, "minimal":0.22, "nude":0.10},
+    "available": true
+  }
+}
+Headers: X-Cache: HIT|MISS
+
+### POST /censor
+Blur NSFW regions. Returns censored image as PNG.
+Content-Type: multipart/form-data
+Fields: file (required), labels (optional, comma-separated label names to censor)
+Query params: model=nudenet|erax
+Response (200): image/png binary
+Response headers:
+  X-Image-Id: 20240101_120000_a1b2c3d4
+  X-Estimated-Age: 25.3
+  X-Minor-Risk: False
+  X-Deepfake-Verdict: likely_real
+  X-Clothing: lingerie
+
+### POST /rateme
+Multi-factor sexiness/attractiveness scoring. Runs NudeNet + EraX + CLIP.
+Content-Type: multipart/form-data
+Fields: file (required)
+Query params: no_cache=0|1
+Response (200):
+{
+  "image_id": "20240101_120000_a1b2c3d4",
+  "models": ["nudenet", "erax"],
+  "rating": {
+    "score": 0.6234,
+    "category": "sensual",
+    "description": "Sensual content",
+    "factors": {
+      "clip_sexiness": {"score": 0.72, "weight": 0.38, "available": true},
+      "eroticism": {"score": 0.55, "weight": 0.27, "breakdown": [{"label":"FEMALE_BREAST_EXPOSED","confidence":0.92,"weight":0.75,"contribution":0.69}]},
+      "image_quality": {"score": 0.81, "weight": 0.12, "resolution": 0.95, "sharpness": 0.78, "brightness": 0.88, "contrast": 0.63},
+      "composition": {"score": 0.65, "weight": 0.10, "has_face": true, "aspect_ratio": 0.75, "centering": 0.82, "pose": {"score": 0.45, "details": "..."}},
+      "aesthetics": {"score": 0.70, "weight": 0.08, "saturation": 0.65, "color_variety": 0.72, "noise_level": 0.15},
+      "age_attractiveness": {"score": 1.0, "weight": 0.05, "estimated_age": 24, "available": true}
+    },
+    "age": {"estimated_age": 24.0, "bracket": "young_adult", "confidence": 0.45, "is_minor_risk": false, "available": true},
+    "deepfake": {"fake_probability": 0.12, "is_likely_fake": false, "verdict": "likely_real", "available": true},
+    "clothing": {"clothing": "lingerie", "exposure_level": 0.65, "scores": {...}, "available": true}
+  },
+  "detections": [...]
+}
+Headers: X-Cache: HIT|MISS
+Factor weights: clip_sexiness=38%, eroticism=27%, image_quality=12%, composition=10%, aesthetics=8%, age_attractiveness=5%
+If CLIP unavailable: clip_sexiness(38%) + age_attractiveness(5%) shift to eroticism (total 70%)
+Categories: safe(0-0.10), mild(0.10-0.25), suggestive(0.25-0.45), sensual(0.45-0.65), erotic(0.65-0.80), explicit(0.80-0.92), extreme(0.92-1.0), blocked(minor detected)
+Minor safety: if minor detected, score forced to 0, category set to "blocked"
+
+### POST /moderate
+All-in-one content moderation. Runs NudeNet + EraX + CLIP in parallel.
+Content-Type: multipart/form-data
+Fields: file (required)
+Query params: no_cache=0|1
+Response (200):
+{
+  "image_id": "20240101_120000_a1b2c3d4",
+  "action": "flag",
+  "confidence": 0.82,
+  "reasons": ["erotic content detected (score 0.72)", "nudity detected: FEMALE_BREAST_EXPOSED (confidence 92%)"],
+  "detections": [...],
+  "rating": {"score": 0.72, "category": "erotic", "description": "Erotic content", "factors": {...}},
+  "clip_analysis": {
+    "sexiness": {"score": 0.72, "available": true},
+    "age": {"estimated_age": 25.3, "bracket": "young_adult", "is_minor_risk": false, "available": true},
+    "deepfake": {"fake_probability": 0.12, "verdict": "likely_real", "available": true},
+    "clothing": {"clothing": "lingerie", "exposure_level": 0.65, "available": true}
+  },
+  "summary": {
+    "nudity_score": 0.65,
+    "violence_score": 0,
+    "text_flags": []
+  }
+}
+Action logic:
+  "block" -- minor risk, extreme category, sexual act with >70% confidence
+  "flag" -- erotic/explicit content, likely_fake deepfake, significant nudity, suggestive/sensual content
+  "allow" -- no concerning content detected
+Headers: X-Cache: HIT|MISS
+
+### POST /batch
+Process ZIP/RAR archive. Classifies all images inside.
+Content-Type: multipart/form-data
+Fields: file (required, ZIP or RAR archive)
+Query params: model=nudenet|erax
+Response (200):
+{
+  "model": "nudenet",
+  "total": 5,
+  "processed": 4,
+  "errors": 1,
+  "results": [
+    {"filename": "img1.jpg", "image_id": "20240101_120000_a1b2c3d4", "detections": [...]},
+    {"filename": "corrupt.jpg", "error": "Invalid image", "detections": []}
+  ]
+}
+
+### POST /embed
+CLIP embedding vector for an image.
+Fields: file (required)
+Query params: normalize=true|false (default: true)
+Response (200):
+{
+  "image_id": "20240101_120000_a1b2c3d4",
+  "embedding": [0.0123, -0.0456, ...],
+  "dimensions": 768,
+  "model": "clip-vit-base-patch32",
+  "normalized": true
+}
+
+### POST /compare
+Cosine similarity between two images via CLIP embeddings.
+Fields: file1, file2 (both required, multipart)
+Response (200):
+{
+  "similarity": 0.8723,
+  "is_similar": true,
+  "embedding_model": "clip-vit-base-patch32"
+}
+Threshold: is_similar=true when similarity >= 0.85
+
+### POST /tag
+Zero-shot labeling. Score image against custom text labels using CLIP.
+Fields: file (multipart), labels (form field, comma-separated, max 50 labels, max 200 chars each)
+Response (200):
+{
+  "image_id": "20240101_120000_a1b2c3d4",
+  "tags": [
+    {"label": "beach scene", "score": 0.6234},
+    {"label": "portrait", "score": 0.2156},
+    {"label": "indoor photo", "score": 0.1610}
+  ],
+  "model": "clip-vit-base-patch32"
+}
+
+### POST /faces
+Detect faces (MediaPipe). Returns face locations as JSON.
+Fields: file (required)
+Response (200):
+{
+  "image_id": "20240101_120000_a1b2c3d4",
+  "faces": [{"box": [100, 50, 80, 90], "score": 0.98}],
+  "count": 1
+}
+
+### POST /anonymize
+Detect and blur faces. Returns anonymized PNG image.
+Fields: file (required)
+Query params: blur_radius=40 (5-200)
+Response (200): image/png binary
+Headers: X-Faces-Found: 2, X-Image-Id: 20240101_120000_a1b2c3d4
+
+### POST /pose
+Estimate body pose (MediaPipe). Returns keypoints and analysis.
+Fields: file (required)
+Response (200):
+{
+  "image_id": "20240101_120000_a1b2c3d4",
+  "pose": { ... }
+}
+
+### POST /video/classify
+Classify video frame by frame. No size/duration limits for auth users.
+Fields: file (required, video file)
+Query params: model=nudenet|erax, fps=1.0 (0.1-30), max_frames=0 (0=unlimited)
+Supported formats: .mp4, .avi, .mov, .mkv, .webm, .flv, .wmv
+Response (200):
+{
+  "video_id": "20240101_120000_a1b2c3d4",
+  "model": "nudenet",
+  "video_info": {"duration": 45.2, "width": 1920, "height": 1080, "fps": 30.0},
+  "settings": {"analyze_fps": 1.0, "max_frames": 0, "frames_analyzed": 45},
+  "frames": [
+    {"timestamp": 0.0, "detections": [{"label": "FEMALE_BREAST_EXPOSED", "score": 0.92, "box": [120,200,80,90], "box_format": "xywh"}]},
+    {"timestamp": 1.0, "detections": []}
+  ],
+  "summary": {
+    "total_detections": 12,
+    "labels_found": {"FEMALE_BREAST_EXPOSED": 8, "BUTTOCKS_EXPOSED": 4},
+    "max_score": 0.9534,
+    "nsfw_frames": 10,
+    "nsfw_percentage": 22.2
+  }
+}
+
+### POST /video/censor
+Censor video -- detect and blur NSFW regions. Returns MP4.
+Fields: file (required), labels (form, optional, comma-separated)
+Query params: model, fps=5.0 (0.1-30), max_frames=0, blur_radius=60 (5-200), interpolate=true
+Response (200): video/mp4 binary
+Headers: X-Video-Id, X-Frames-Analyzed, X-Detections-Found
+
+### POST /video/scenes
+Extract NSFW scenes as compiled highlight video. Returns MP4.
+Fields: file (required)
+Query params: model, fps=2.0 (0.5-10), min_scene_duration=2.0 (>=0.5s), scene_padding=1.0 (>=0s)
+Response (200): video/mp4 binary
+Headers:
+  X-Video-Id: 20240101_120000_a1b2c3d4
+  X-Scenes-Found: 3
+  X-Total-Duration: 120.50
+  X-Scenes-Duration: 28.40
+  X-Scenes-Metadata: [{"index":0,"start":12.5,"end":22.3,"duration":9.8},...]
+Error 404: "No NSFW scenes detected in video."
+
+### GET /images
+List stored images.
+Query params: category=censored|originals (default: censored), limit=50 (max 200)
+Response (200):
+{
+  "category": "censored",
+  "images": [
+    {"id": "20240101_120000_a1b2c3d4", "filename": "20240101_120000_a1b2c3d4.png", "size": 245000, "created": "2024-01-01T12:00:00+00:00"}
+  ]
+}
+
+### GET /images/{category}/{image_id}
+Retrieve stored image by ID. category=originals|censored
+Response: image file (FileResponse)
+
+### GET /storage/{category}/{filename}
+Public image access by full filename. No auth required. IDs contain UUID, not guessable.
+category=originals|censored
+Response: image file (FileResponse)
+
+### GET /health
+No auth required.
+Response (200):
+{
+  "status": "ok",
+  "models": {"nudenet": true, "erax": true},
+  "workers": {"pool_size": 2, "active": 0}
+}
+
+### GET /models
+No auth required.
+Response (200):
+{
+  "models": [
+    {"id": "nudenet", "name": "NudeNet 640m", "description": "YOLOv8m -- 18 labels, covered + exposed distinction", "labels": [...], "default_censor": [...]},
+    {"id": "erax", "name": "EraX Anti-NSFW v1.1", "description": "YOLO11s -- 5 labels, higher accuracy, exposed only", "labels": [...], "default_censor": [...]}
+  ]
+}
+
+## Endpoints -- Demo (no auth, IP rate limited)
+
+All demo endpoints return extra fields: "demo": true, "limits": {images_remaining, archives_remaining, reset_in}
+Demo rate limits: 10 images/hour, 1 archive/hour per IP.
+Demo max upload: 10MB images, 50MB videos/archives.
+Demo video limit: max 30 seconds, max 20 frames.
+
+### POST /demo/classify
+Same as /classify but no auth, IP rate limited, no CLIP analysis.
+Params: model=nudenet|erax
+Response: {model, detections, image_id, demo:true, limits:{...}}
+
+### POST /demo/rateme
+Same as /rateme but no auth, IP rate limited.
+Response: {models, rating, detections, demo:true, limits:{...}}
+
+### POST /demo/moderate
+Same as /moderate but no auth, IP rate limited.
+Response: {action, confidence, reasons, detections, rating, clip_analysis, summary, demo:true, limits:{...}}
+
+### POST /demo/batch
+Same as /batch but no auth, max 10 images per archive, 1 archive/hour.
+Response: {model, total, processed, results, demo:true, limits:{...}}
+
+### POST /demo/embed
+Same as /embed but no auth, IP rate limited.
+Response: {image_id, embedding, dimensions, model, normalized, demo:true, limits:{...}}
+
+### POST /demo/compare
+Same as /compare but no auth, counts as 2 images against rate limit.
+Response: {similarity, is_similar, embedding_model, demo:true, limits:{...}}
+
+### POST /demo/tag
+Same as /tag but no auth, IP rate limited.
+Response: {image_id, tags, model, demo:true, limits:{...}}
+
+### POST /demo/faces
+Same as /faces but no auth, IP rate limited.
+Response: {image_id, faces, count, demo:true, limits:{...}}
+
+### POST /demo/anonymize
+Same as /anonymize but no auth, IP rate limited.
+Response: image/png with headers X-Faces-Found, X-Image-Id
+
+### POST /demo/pose
+Same as /pose but no auth, IP rate limited.
+Response: {image_id, pose, demo:true, limits:{...}}
+
+### POST /demo/video/classify
+Same as /video/classify but no auth, max 30s video, max 20 frames, fps max 5.0.
+Response: same as /video/classify plus {demo:true, limits:{...}}
+
+### POST /demo/video/scenes
+Same as /video/scenes but no auth, max 30s video, max 20 frames, fps max 5.0.
+Response: video/mp4 with same headers as /video/scenes
+
+### GET /demo/limits
+Check remaining demo rate limits for current IP.
+Response: {images_remaining: 8, archives_remaining: 1, reset_in: 2400}
+
+### GET /demo/admin/usage
+Super admin endpoint. Live demo usage from memory.
+Response: {demo_users: {...}}
+
+## curl Examples
+
+# Classify an image
+curl -X POST http://localhost:8000/classify \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@photo.jpg"
+
+# Classify with EraX model
+curl -X POST http://localhost:8000/classify?model=erax \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@photo.jpg"
+
+# Bypass cache
+curl -X POST http://localhost:8000/classify?no_cache=1 \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@photo.jpg"
+
+# Censor specific labels only
+curl -X POST http://localhost:8000/censor \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@photo.jpg" \
+  -F "labels=FEMALE_BREAST_EXPOSED,FEMALE_GENITALIA_EXPOSED" \
+  -o censored.png
+
+# Rate an image
+curl -X POST http://localhost:8000/rateme \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@photo.jpg"
+
+# Moderate an image
+curl -X POST http://localhost:8000/moderate \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@photo.jpg"
+
+# Get CLIP embedding
+curl -X POST http://localhost:8000/embed \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@photo.jpg"
+
+# Compare two images
+curl -X POST http://localhost:8000/compare \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file1=@photo1.jpg" \
+  -F "file2=@photo2.jpg"
+
+# Zero-shot tagging
+curl -X POST http://localhost:8000/tag \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@photo.jpg" \
+  -F "labels=beach scene,indoor photo,portrait,landscape,selfie"
+
+# Detect faces
+curl -X POST http://localhost:8000/faces \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@photo.jpg"
+
+# Anonymize faces
+curl -X POST http://localhost:8000/anonymize?blur_radius=60 \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@photo.jpg" \
+  -o anonymous.png
+
+# Classify video
+curl -X POST "http://localhost:8000/video/classify?fps=2&model=nudenet" \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@video.mp4"
+
+# Censor video
+curl -X POST "http://localhost:8000/video/censor?fps=5&blur_radius=80" \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@video.mp4" \
+  -o censored.mp4
+
+# Extract NSFW scenes
+curl -X POST "http://localhost:8000/video/scenes?min_scene_duration=3&scene_padding=1.5" \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@video.mp4" \
+  -o scenes.mp4
+
+# Batch process archive
+curl -X POST http://localhost:8000/batch?model=nudenet \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@images.zip"
+
+# Demo classify (no auth)
+curl -X POST http://localhost:8000/demo/classify \
+  -F "file=@photo.jpg"
+
+# Check demo limits
+curl http://localhost:8000/demo/limits
+
+# Health check
+curl http://localhost:8000/health

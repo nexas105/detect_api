@@ -1,0 +1,159 @@
+# EroHub NSFW Detection API -- LLM Reference
+# Base URL: https://your-domain.com (or http://localhost:8000 for dev)
+# Auth: API key as Bearer token in Authorization header
+# All image endpoints accept multipart/form-data with field "file"
+# Box format: [x, y, width, height] (xywh) for all models
+# Max upload: 50MB images, 200MB videos (auth), 10MB images (demo)
+
+## Authentication
+All endpoints except /demo/* and /health require an API key:
+  Authorization: Bearer ehk_xxxxx
+
+## Detection Models
+
+NudeNet (nudenet) -- YOLOv8m, 640m.onnx, 18 labels:
+  FEMALE_BREAST_EXPOSED, FEMALE_BREAST_COVERED,
+  FEMALE_GENITALIA_EXPOSED, FEMALE_GENITALIA_COVERED,
+  MALE_GENITALIA_EXPOSED, MALE_GENITALIA_COVERED,
+  BUTTOCKS_EXPOSED, BUTTOCKS_COVERED,
+  ANUS_EXPOSED, ANUS_COVERED,
+  BELLY_EXPOSED, BELLY_COVERED,
+  ARMPITS_EXPOSED, ARMPITS_COVERED,
+  FEET_EXPOSED, FEET_COVERED,
+  FACE_FEMALE, FACE_MALE
+
+EraX (erax) -- YOLO11s, 5 labels:
+  NIPPLE, PENIS, VAGINA, ANUS, MAKE_LOVE
+
+CLIP (clip-vit-base-patch32) -- used for age, deepfake, clothing, sexiness, embeddings
+
+## Endpoints
+
+### POST /classify
+Detect NSFW content in an image. Returns detections + CLIP analysis.
+Params: model=nudenet|erax (default: nudenet), no_cache=0|1
+Response: {image_id, model, detections: [{label, score, box:[x,y,w,h]}], age?, deepfake?, clothing?}
+Header: X-Cache: HIT|MISS
+
+### POST /censor
+Blur NSFW regions. Returns censored PNG image.
+Params: model=nudenet|erax, labels=COMMA_SEPARATED (form field, optional)
+Response: image/png binary
+Headers: X-Image-Id, X-Estimated-Age, X-Minor-Risk, X-Deepfake-Verdict, X-Clothing
+
+### POST /rateme
+Multi-factor sexiness/attractiveness scoring. Runs NudeNet + EraX + CLIP.
+Params: no_cache=0|1
+Response: {image_id, models:["nudenet","erax"], rating:{score, category, description, factors:{...}}, detections:[...]}
+Header: X-Cache: HIT|MISS
+Factor weights: clip_sexiness=38%, eroticism=27%, image_quality=12%, composition=10%, aesthetics=8%, age_attractiveness=5%
+Categories: safe(0-0.10), mild(0.10-0.25), suggestive(0.25-0.45), sensual(0.45-0.65), erotic(0.65-0.80), explicit(0.80-0.92), extreme(0.92-1.0), blocked(minor)
+
+### POST /moderate
+All-in-one content moderation. Runs NudeNet + EraX + CLIP + Rate-Me.
+Params: no_cache=0|1
+Response: {image_id, action:"allow"|"flag"|"block", confidence, reasons:[], detections, rating, clip_analysis:{sexiness,age,deepfake,clothing}, summary:{nudity_score,violence_score,text_flags}}
+Header: X-Cache: HIT|MISS
+
+### POST /batch
+Process ZIP/RAR archive. Classifies all images inside.
+Params: model=nudenet|erax
+Response: {model, total, processed, errors, results:[{filename, image_id?, detections, error?}]}
+
+### POST /embed
+CLIP embedding vector for an image.
+Params: normalize=true|false
+Response: {image_id, embedding:[768 floats], dimensions:768, model:"clip-vit-base-patch32", normalized}
+
+### POST /compare
+Cosine similarity between two images via CLIP.
+Fields: file1, file2 (both multipart)
+Response: {similarity:float, is_similar:bool (>=0.85), embedding_model}
+
+### POST /tag
+Zero-shot labeling. Score image against custom text labels.
+Fields: file (multipart), labels (form, comma-separated, max 50, max 200 chars each)
+Response: {image_id, tags:[{label, score}], model}
+
+### POST /faces
+Detect faces only. Returns face locations.
+Response: {image_id, faces:[{box, score, ...}], count}
+
+### POST /anonymize
+Detect and blur faces. Returns anonymized PNG.
+Params: blur_radius=40 (5-200)
+Response: image/png binary
+Headers: X-Faces-Found, X-Image-Id
+
+### POST /pose
+Estimate body pose. Returns keypoints.
+Response: {image_id, pose:{...}}
+
+### POST /video/classify
+Classify video frame by frame. No size/duration limits for auth users.
+Params: model=nudenet|erax, fps=1.0 (0.1-30), max_frames=0 (0=unlimited)
+Response: {video_id, model, video_info, settings, frames:[{timestamp, detections}], summary:{total_detections, labels_found, max_score, nsfw_frames, nsfw_percentage}}
+
+### POST /video/censor
+Censor video -- detect and blur NSFW regions.
+Params: model, fps=5.0, max_frames=0, labels (form), blur_radius=60 (5-200), interpolate=true
+Response: video/mp4 binary
+Headers: X-Video-Id, X-Frames-Analyzed, X-Detections-Found
+
+### POST /video/scenes
+Extract NSFW scenes as compiled highlight video.
+Params: model, fps=2.0 (0.5-10), min_scene_duration=2.0 (>=0.5), scene_padding=1.0 (>=0)
+Response: video/mp4 binary
+Headers: X-Video-Id, X-Scenes-Found, X-Total-Duration, X-Scenes-Duration, X-Scenes-Metadata (JSON)
+
+### GET /images
+List stored images. Params: category=censored|originals, limit=50 (max 200)
+Response: {category, images:[{id, filename, size, created}]}
+
+### GET /images/{category}/{image_id}
+Retrieve stored image. category=originals|censored
+Response: image file
+
+### GET /storage/{category}/{filename}
+Public image access by full filename (IDs contain UUID -- not guessable).
+Response: image file
+
+### GET /health
+No auth. Response: {status:"ok", models:{nudenet:bool, erax:bool}, workers:{...}}
+
+### GET /models
+No auth. Response: {models:[{id, name, description, labels, default_censor}]}
+
+## Errors
+Format: {"detail": "error message"}
+Status codes: 400 (bad request), 401 (unauthorized), 413 (file too large), 429 (rate limited), 503 (service unavailable)
+
+## curl Examples
+
+# Classify an image
+curl -X POST https://api.example.com/classify \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@photo.jpg" \
+  -F "model=nudenet"
+
+# Censor an image
+curl -X POST https://api.example.com/censor \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@photo.jpg" \
+  -o censored.png
+
+# Rate an image
+curl -X POST https://api.example.com/rateme \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@photo.jpg"
+
+# Moderate an image
+curl -X POST https://api.example.com/moderate \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@photo.jpg"
+
+# Zero-shot tagging
+curl -X POST https://api.example.com/tag \
+  -H "Authorization: Bearer ehk_xxxxx" \
+  -F "file=@photo.jpg" \
+  -F "labels=beach scene,indoor photo,portrait,landscape"

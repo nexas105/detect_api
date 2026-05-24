@@ -1,0 +1,12 @@
+fastapi>=0.115
+pydantic[email]>=2.0
+uvicorn[standard]>=0.34
+sqlalchemy[asyncio]>=2.0
+greenlet>=3.0
+alembic>=1.15
+pyjwt>=2.9
+bcrypt>=4.0
+python-multipart>=0.0.18
+aiosqlite>=0.21
+asyncpg>=0.30
+httpx>=0.28

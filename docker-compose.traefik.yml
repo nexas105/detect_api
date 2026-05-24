@@ -1,0 +1,68 @@
+# Standalone Traefik reverse proxy + SSL (without Coolify)
+# Usage: docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d
+#
+# Set domains via DOMAIN_API, DOMAIN_AUTH, DOMAIN_STUDIO in .env.coolify
+# Set ACME_EMAIL for Let's Encrypt certificate registration
+
+services:
+  traefik:
+    image: traefik:v3
+    command:
+      - "--api.dashboard=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.http.address=:80"
+      - "--entrypoints.https.address=:443"
+      - "--entrypoints.http.http.redirections.entryPoint.to=https"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-admin@example.com}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt:/letsencrypt
+    restart: unless-stopped
+
+  db:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  auth:
+    ports:
+      - "127.0.0.1:8001:8001"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.auth.rule=Host(`${DOMAIN_AUTH:-auth.localhost}`)"
+      - "traefik.http.routers.auth.entrypoints=https"
+      - "traefik.http.routers.auth.tls.certresolver=letsencrypt"
+      - "traefik.http.services.auth.loadbalancer.server.port=8001"
+
+  api:
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      AUTH_SERVICE_URL: http://auth:8001
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=Host(`${DOMAIN_API:-api.localhost}`)"
+      - "traefik.http.routers.api.entrypoints=https"
+      - "traefik.http.routers.api.tls.certresolver=letsencrypt"
+      - "traefik.http.services.api.loadbalancer.server.port=8000"
+
+  studio:
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      NEXT_PUBLIC_AUTH_URL: https://${DOMAIN_AUTH:-auth.localhost}
+      NEXT_PUBLIC_API_URL: https://${DOMAIN_API:-api.localhost}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.studio.rule=Host(`${DOMAIN_STUDIO:-studio.localhost}`)"
+      - "traefik.http.routers.studio.entrypoints=https"
+      - "traefik.http.routers.studio.tls.certresolver=letsencrypt"
+      - "traefik.http.services.studio.loadbalancer.server.port=3000"
+
+volumes:
+  letsencrypt:

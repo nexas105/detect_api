@@ -1,0 +1,19 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+python-multipart==0.0.9
+nudenet==3.4.2
+Pillow==10.4.0
+ultralytics>=8.3.0
+huggingface-hub
+transformers>=4.40,<5
+httpx>=0.28
+rarfile>=4.0
+redis>=5.0
+opencv-python-headless>=4.8
+mediapipe>=0.10,<0.10.21
+boto3>=1.34
+# CPU-only PyTorch — saves ~2.5GB by excluding CUDA/NVIDIA packages.
+# If you have a GPU, remove these two lines and let ultralytics pull the GPU version.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.11.0+cpu
+torchvision==0.26.0+cpu
