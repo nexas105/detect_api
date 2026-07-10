@@ -7,13 +7,13 @@ import {
   Button,
   Center,
   Collapse,
+  FileInput,
   Group,
   Image,
   Loader,
   Paper,
   Radio,
   SegmentedControl,
-  Select,
   Slider,
   Stack,
   Switch,
@@ -28,12 +28,14 @@ import {
   IconDownload,
   IconEyeOff,
   IconFileUpload,
+  IconPhoto,
   IconUpload,
 } from '@tabler/icons-react';
 import { useCallback, useRef, useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { DashboardShell } from '@/components/DashboardShell/DashboardShell';
 import { PageHeader } from '@/components/PageHeader/PageHeader';
+import { ProcessingQueue } from '@/components/ProcessingQueue/ProcessingQueue';
 import {
   ClipAnalysisCards,
   AgeAnalysis,
@@ -42,45 +44,13 @@ import {
 } from '@/components/ClipAnalysisCards';
 import { API_URL } from '@/lib/auth';
 import { useApiKeys } from '@/lib/use-api-keys';
+import { ApiKeySelect } from '@/components/ApiKeySelect';
+import type { Detection } from '@/lib/api-types';
 
 const ACCEPTED_IMAGE = '.jpg,.jpeg,.png,.webp';
 const ACCEPTED_ARCHIVE = '.zip,.rar';
 const ACCEPTED_VIDEO = '.mp4,.avi,.mov,.mkv,.webm';
 const ACCEPTED_ALL = `${ACCEPTED_IMAGE},${ACCEPTED_ARCHIVE},${ACCEPTED_VIDEO}`;
-
-interface Detection {
-  label: string;
-  score: number;
-  box?: number[];
-  model?: string;
-}
-
-function iou(a: number[], b: number[]): number {
-  const [ax, ay, aw, ah] = a;
-  const [bx, by, bw, bh] = b;
-  const x1 = Math.max(ax, bx), y1 = Math.max(ay, by);
-  const x2 = Math.min(ax + aw, bx + bw), y2 = Math.min(ay + ah, by + bh);
-  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
-  const union = aw * ah + bw * bh - inter;
-  return union > 0 ? inter / union : 0;
-}
-
-function mergeDetections(nnDets: Detection[], exDets: Detection[]): Detection[] {
-  const merged = [...nnDets];
-  for (const exDet of exDets) {
-    const isDuplicate = merged.some(
-      (m) =>
-        m.label === exDet.label &&
-        m.box &&
-        exDet.box &&
-        iou(m.box, exDet.box) > 0.3
-    );
-    if (!isDuplicate) {
-      merged.push(exDet);
-    }
-  }
-  return merged.sort((a, b) => b.score - a.score);
-}
 
 interface SingleResult {
   image_id?: string;
@@ -138,7 +108,11 @@ export default function UploadPage() {
   const t = useTranslations('upload');
   const tCommon = useTranslations('common');
   const fileRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
   const [file, setFile] = useState<File | null>(null);
+  const [batchFiles, setBatchFiles] = useState<File[]>([]);
+  const [batchProgress, setBatchProgress] = useState<number | undefined>(undefined);
+  const [startTime, setStartTime] = useState<number | undefined>(undefined);
   const [model, setModel] = useState('nudenet');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -171,6 +145,7 @@ export default function UploadPage() {
 
   const handleModeChange = (value: string) => {
     setMode(value as 'classify' | 'censor');
+    setBatchFiles([]);
     setResult(null);
     setError('');
     if (censoredUrl) {
@@ -186,6 +161,7 @@ export default function UploadPage() {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0] ?? null;
     setFile(f);
+    if (f) setBatchFiles([]);
     setResult(null);
     setError('');
     if (censoredUrl) {
@@ -207,8 +183,11 @@ export default function UploadPage() {
   const handleAnalyze = useCallback(async () => {
     if (!file || !selectedKey.trim()) return;
     setLoading(true);
+    setStartTime(Date.now());
     setError('');
     setResult(null);
+    const controller = new AbortController();
+    abortRef.current = controller;
     if (censoredUrl) {
       URL.revokeObjectURL(censoredUrl);
       setCensoredUrl(null);
@@ -228,7 +207,7 @@ export default function UploadPage() {
       if (mode === 'censor') {
         // Censor mode — response is binary
         const isVid = isVideo(file);
-        const params = new URLSearchParams({ model });
+        const params = new URLSearchParams({ model: model === 'both' ? 'ensemble' : model });
         if (isVid) {
           params.set('fps', videoFps);
           params.set('max_frames', videoMaxFrames);
@@ -243,6 +222,7 @@ export default function UploadPage() {
           method: 'POST',
           headers: { Authorization: `Bearer ${selectedKey.trim()}` },
           body: formData,
+          signal: controller.signal,
         });
 
         if (!res.ok) {
@@ -257,50 +237,9 @@ export default function UploadPage() {
         } else {
           setCensoredUrl(url);
         }
-      } else if (model === 'both' && !isVideo(file) && !isArchive(file)) {
-        // Both models — run two classify calls in parallel, merge results
-        const headers = { Authorization: `Bearer ${selectedKey.trim()}` };
-
-        const formData1 = new FormData();
-        formData1.append('file', file);
-        const formData2 = new FormData();
-        formData2.append('file', file);
-
-        const [nnRes, exRes] = await Promise.all([
-          fetch(`${API_URL}/classify?model=nudenet`, { method: 'POST', headers, body: formData1 }),
-          fetch(`${API_URL}/classify?model=erax`, { method: 'POST', headers, body: formData2 }),
-        ]);
-
-        if (!nnRes.ok) {
-          const err = await nnRes.json().catch(() => ({}));
-          throw new Error(err.detail || `NudeNet request failed (${nnRes.status})`);
-        }
-        if (!exRes.ok) {
-          const err = await exRes.json().catch(() => ({}));
-          throw new Error(err.detail || `EraX request failed (${exRes.status})`);
-        }
-
-        const nnData: SingleResult = await nnRes.json();
-        const exData: SingleResult = await exRes.json();
-
-        const nnDets = nnData.detections.map((d) => ({ ...d, model: 'nudenet' as string }));
-        const exDets = exData.detections.map((d) => ({ ...d, model: 'erax' as string }));
-        const merged = mergeDetections(nnDets, exDets);
-
-        setResult({
-          type: 'single',
-          data: {
-            ...nnData,
-            model: 'both',
-            detections: merged,
-            age: nnData.age || exData.age,
-            deepfake: nnData.deepfake || exData.deepfake,
-            clothing: nnData.clothing || exData.clothing,
-          },
-        });
       } else {
         // Classify mode — response is JSON
-        const actualModel = model === 'both' ? 'nudenet' : model;
+        const actualModel = model === 'both' ? 'ensemble' : model;
         const endpoint = isVideo(file)
           ? `${API_URL}/video/classify?model=${actualModel}&fps=${videoFps}&max_frames=${videoMaxFrames}`
           : isArchive(file)
@@ -311,6 +250,7 @@ export default function UploadPage() {
           method: 'POST',
           headers: { Authorization: `Bearer ${selectedKey.trim()}` },
           body: formData,
+          signal: controller.signal,
         });
 
         if (!res.ok) {
@@ -329,11 +269,88 @@ export default function UploadPage() {
         }
       }
     } catch (err: any) {
-      setError(err.message || 'Analysis failed');
+      if (err.name !== 'AbortError') setError(err.message || 'Analysis failed');
     } finally {
       setLoading(false);
+      setStartTime(undefined);
+      abortRef.current = null;
     }
   }, [file, model, selectedKey, videoFps, videoMaxFrames, mode, censorLabels, blurRadius, interpolate, censoredUrl, censoredVideoUrl]);
+
+  // Multi-image batch: the backend /batch only accepts a single ZIP/RAR archive
+  // (api/src/endpoints/batch.py — `file: UploadFile`), so multiple raw images are
+  // fanned out to /classify with bounded concurrency and aggregated into the same
+  // BatchResult shape the page already renders.
+  // ponytail: client-side pool of 4; server inference is lock-serialized anyway.
+  const handleBatchMulti = useCallback(async () => {
+    if (!batchFiles.length || !selectedKey.trim()) return;
+    setLoading(true);
+    setStartTime(Date.now());
+    setBatchProgress(0);
+    setError('');
+    setResult(null);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const actualModel = model === 'both' ? 'ensemble' : model;
+    const results: BatchFileResult[] = new Array(batchFiles.length);
+    let next = 0;
+    let done = 0;
+
+    const worker = async () => {
+      while (true) {
+        const i = next++;
+        if (i >= batchFiles.length) break;
+        const f = batchFiles[i];
+        try {
+          const fd = new FormData();
+          fd.append('file', f);
+          const res = await fetch(`${API_URL}/classify?model=${actualModel}`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${selectedKey.trim()}` },
+            body: fd,
+            signal: controller.signal,
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || `Request failed (${res.status})`);
+          }
+          const d = await res.json();
+          results[i] = { filename: f.name, image_id: d.image_id, detections: d.detections || [] };
+        } catch (e: any) {
+          if (e.name === 'AbortError') throw e;
+          results[i] = { filename: f.name, error: e.message || 'Failed', detections: [] };
+        } finally {
+          done += 1;
+          setBatchProgress(Math.round((done / batchFiles.length) * 100));
+        }
+      }
+    };
+
+    try {
+      await Promise.all(
+        Array.from({ length: Math.min(4, batchFiles.length) }, worker)
+      );
+      setResult({
+        type: 'batch',
+        data: {
+          model: actualModel,
+          total: batchFiles.length,
+          processed: results.filter((r) => r?.image_id).length,
+          errors: results.filter((r) => r?.error).length,
+          results,
+        },
+      });
+    } catch (err: any) {
+      if (err.name !== 'AbortError') setError(err.message || 'Batch failed');
+    } finally {
+      setLoading(false);
+      setStartTime(undefined);
+      setBatchProgress(undefined);
+      abortRef.current = null;
+    }
+  }, [batchFiles, model, selectedKey]);
+
+  const handleCancel = () => abortRef.current?.abort();
 
   return (
     <DashboardShell>
@@ -353,27 +370,15 @@ export default function UploadPage() {
       <Paper withBorder p="lg" radius="md" mb="xl">
         <Stack>
           {/* API Key selection */}
-          <Paper withBorder p="sm" radius="md">
-            <Text size="sm" fw={500} mb={4}>
-              {t('selectedKey')} <Text span c="red">*</Text>
-            </Text>
-            <Select
-              placeholder={t('selectKey')}
-              data={keys.map((k) => ({
-                value: k.id,
-                label: `${k.name}${k.is_master ? ' [master]' : ''} — ${k.is_own && !k.key.endsWith('...') ? 'ready' : k.key}`,
-              }))}
-              value={selectedKeyId}
-              onChange={selectKey}
-              clearable
-              mb="xs"
-            />
-            <TextInput
-              placeholder="Paste your full API key (ehk_...)"
-              value={selectedKey}
-              onChange={(e) => setSelectedKey(e.currentTarget.value)}
-            />
-          </Paper>
+          <ApiKeySelect
+            keys={keys}
+            selectedKey={selectedKey}
+            setSelectedKey={setSelectedKey}
+            selectedKeyId={selectedKeyId}
+            selectKey={selectKey}
+            label={t('selectedKey')}
+            placeholder={t('selectKey')}
+          />
 
           {/* File picker */}
           <div>
@@ -405,6 +410,29 @@ export default function UploadPage() {
               Supported: JPG, PNG, WebP, ZIP, RAR, MP4, AVI, MOV, MKV, WEBM
             </Text>
           </div>
+
+          {/* Multi-image batch (classify mode only) */}
+          {mode === 'classify' && (
+            <FileInput
+              label="Or batch multiple images"
+              description="Select several images to scan them all in one batch."
+              placeholder="Select images"
+              leftSection={<IconPhoto size={16} />}
+              accept={ACCEPTED_IMAGE}
+              multiple
+              clearable
+              value={batchFiles}
+              onChange={(files) => {
+                setBatchFiles(files);
+                if (files.length) {
+                  setFile(null);
+                  if (fileRef.current) fileRef.current.value = '';
+                }
+                setResult(null);
+                setError('');
+              }}
+            />
+          )}
 
           {/* Model selector */}
           <Radio.Group
@@ -482,13 +510,15 @@ export default function UploadPage() {
           {/* Analyze / Censor button */}
           <Button
             leftSection={mode === 'censor' ? <IconEyeOff size={16} /> : <IconUpload size={16} />}
-            onClick={handleAnalyze}
+            onClick={batchFiles.length > 0 ? handleBatchMulti : handleAnalyze}
             loading={loading}
-            disabled={!file || !selectedKey.trim()}
+            disabled={(!file && batchFiles.length === 0) || !selectedKey.trim()}
             fullWidth
             color={mode === 'censor' ? 'red' : undefined}
           >
-            {mode === 'censor'
+            {batchFiles.length > 0
+              ? `Analyze ${batchFiles.length} image${batchFiles.length !== 1 ? 's' : ''}`
+              : mode === 'censor'
               ? file && isVideo(file)
                 ? 'Censor Video'
                 : 'Censor Image'
@@ -498,6 +528,13 @@ export default function UploadPage() {
           </Button>
         </Stack>
       </Paper>
+
+      <ProcessingQueue
+        isProcessing={loading}
+        progress={batchProgress}
+        onCancel={handleCancel}
+        startTime={startTime}
+      />
 
       {/* Censored image result */}
       {censoredUrl && (

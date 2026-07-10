@@ -20,7 +20,7 @@ import {
 import { useDisclosure } from '@mantine/hooks';
 import { notifications } from '@mantine/notifications';
 import { IconCopy, IconEye, IconKey, IconPlus, IconTrash } from '@tabler/icons-react';
-import { useCallback, useEffect, useState } from 'react';
+import { useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { DashboardShell } from '@/components/DashboardShell/DashboardShell';
 import { PageHeader } from '@/components/PageHeader/PageHeader';
@@ -28,6 +28,7 @@ import { EmptyState } from '@/components/EmptyState/EmptyState';
 import { SkeletonList } from '@/components/SkeletonList/SkeletonList';
 import { ConfirmDialog } from '@/components/ConfirmDialog/ConfirmDialog';
 import { AUTH_URL, useAuth } from '@/lib/auth';
+import { useAuthQuery } from '@/lib/use-auth-query';
 
 interface ApiKey {
   id: string;
@@ -42,8 +43,10 @@ export default function ApiKeysPage() {
   const { user, authFetch } = useAuth();
   const t = useTranslations('apiKeys');
   const tCommon = useTranslations('common');
-  const [keys, setKeys] = useState<ApiKey[]>([]);
-  const [loading, setLoading] = useState(true);
+  const { data, isLoading: loading, refetch: fetchKeys } = useAuthQuery<
+    { keys?: ApiKey[] } | ApiKey[]
+  >('/api-keys');
+  const keys = Array.isArray(data) ? data : data?.keys ?? [];
   const [newKeyName, setNewKeyName] = useState('');
   const [isMasterKey, setIsMasterKey] = useState(false);
   const [createdKey, setCreatedKey] = useState<string | null>(null);
@@ -52,22 +55,6 @@ export default function ApiKeysPage() {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
   const isAdmin = user?.role === 'admin';
-
-  const fetchKeys = useCallback(async () => {
-    try {
-      const res = await authFetch(`${AUTH_URL}/api-keys`);
-      if (res.ok) {
-        const data = await res.json();
-        setKeys(data.keys || data);
-      }
-    } finally {
-      setLoading(false);
-    }
-  }, [authFetch]);
-
-  useEffect(() => {
-    fetchKeys();
-  }, [fetchKeys]);
 
   const handleCreate = async () => {
     if (!newKeyName.trim()) return;
@@ -188,13 +175,13 @@ export default function ApiKeysPage() {
                       </Group>
                     </Table.Td>
                     <Table.Td>
-                      <Code>{k.key_preview}...</Code>
+                      <Code className="data-mono">{k.key_preview}...</Code>
                     </Table.Td>
                     <Table.Td>
-                      <Text size="sm">{k.rate_limit != null ? `${k.rate_limit}/min` : tCommon('noData')}</Text>
+                      <Text className="data-mono" size="sm">{k.rate_limit != null ? `${k.rate_limit}/min` : tCommon('noData')}</Text>
                     </Table.Td>
                     <Table.Td>
-                      <Text size="sm">{new Date(k.created_at).toLocaleDateString()}</Text>
+                      <Text className="data-mono" size="sm">{new Date(k.created_at).toLocaleDateString()}</Text>
                     </Table.Td>
                     <Table.Td>
                       <Group gap="xs">
@@ -235,12 +222,12 @@ export default function ApiKeysPage() {
                     <IconTrash size={16} />
                   </ActionIcon>
                 </Group>
-                <Code>{k.key_preview}...</Code>
+                <Code className="data-mono">{k.key_preview}...</Code>
                 <Group gap="md" mt="xs">
-                  <Text size="xs" c="dimmed">
+                  <Text className="data-mono" size="xs" c="dimmed">
                     {tCommon('limits')}: {k.rate_limit != null ? `${k.rate_limit}/min` : tCommon('noData')}
                   </Text>
-                  <Text size="xs" c="dimmed">
+                  <Text className="data-mono" size="xs" c="dimmed">
                     {tCommon('created')}: {new Date(k.created_at).toLocaleDateString()}
                   </Text>
                 </Group>

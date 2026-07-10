@@ -1,20 +1,18 @@
 'use client';
 
-import React from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import {
   Alert,
   Badge,
+  Box,
   Button,
   Group,
   Paper,
-  Progress,
   RingProgress,
-  Select,
   SimpleGrid,
   Stack,
   Table,
   Text,
-  TextInput,
 } from '@mantine/core';
 import {
   IconAlertCircle,
@@ -23,44 +21,25 @@ import {
   IconFileUpload,
   IconStars,
 } from '@tabler/icons-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { DashboardShell } from '@/components/DashboardShell/DashboardShell';
 import { PageHeader } from '@/components/PageHeader/PageHeader';
-import {
-  ClipAnalysisCards,
-  AgeAnalysis,
-  DeepfakeAnalysis,
-  ClothingAnalysis,
-} from '@/components/ClipAnalysisCards';
-import { API_URL, AUTH_URL, useAuth } from '@/lib/auth';
-
-interface ApiKeyOption {
-  id: string;
-  name: string;
-  key: string;
-  is_own: boolean;
-  is_master: boolean;
-}
+import { ClipAnalysisCards } from '@/components/ClipAnalysisCards';
+import { ApiKeySelect } from '@/components/ApiKeySelect';
+import { API_URL } from '@/lib/auth';
+import { useApiKeys } from '@/lib/use-api-keys';
+import { colorForLabel } from '@/lib/detection-draw';
+import type { RateMeResult } from '@/lib/api-types';
 
 const ACCEPTED_IMAGE = '.jpg,.jpeg,.png,.webp';
 
 const CATEGORY_COLORS: Record<string, string> = {
-  safe: 'green',
+  safe: 'allow',
   mild: 'teal',
-  suggestive: 'yellow',
+  suggestive: 'flag',
   erotic: 'orange',
-  explicit: 'red',
+  explicit: 'block',
   extreme: 'grape',
-};
-
-const FACTOR_COLORS: Record<string, string> = {
-  eroticism: 'red',
-  clip_sexiness: 'violet',
-  image_quality: 'blue',
-  composition: 'teal',
-  aesthetics: 'orange',
-  age_attractiveness: 'pink',
 };
 
 const FACTOR_LABELS: Record<string, string> = {
@@ -72,126 +51,70 @@ const FACTOR_LABELS: Record<string, string> = {
   age_attractiveness: 'Age Attractiveness',
 };
 
-interface BreakdownItem {
-  label: string;
-  confidence: number;
-  weight: number;
-  contribution: number;
+/** Section eyebrow — uppercase mono, per DESIGN_SPEC. */
+function Eyebrow({ children }: { children: React.ReactNode }) {
+  return (
+    <Text className="data-mono" fz={11} fw={600} tt="uppercase" lts={1.5} c="dimmed" mb="md">
+      {children}
+    </Text>
+  );
 }
 
-interface ClipPrompt {
-  prompt: string;
-  similarity: number;
-  weight: number;
-  contribution: number;
+/** Calibrated meter — hairline track + cyan fill, mono readout. */
+function Meter({ label, value, weight }: { label: string; value: number; weight?: number }) {
+  const pct = Math.round((value ?? 0) * 100);
+  return (
+    <div>
+      <Group justify="space-between" mb={4} wrap="nowrap">
+        <Text size="sm">{label}</Text>
+        <Group gap="sm" wrap="nowrap">
+          {weight !== undefined && (
+            <Text className="data-mono" fz={11} c="dimmed">
+              w {weight}
+            </Text>
+          )}
+          <Text className="data-mono" size="sm" fw={600}>
+            {pct}%
+          </Text>
+        </Group>
+      </Group>
+      <Box h={6} style={{ background: 'var(--surface-2)', borderRadius: 3, overflow: 'hidden' }}>
+        <Box
+          h={6}
+          style={{
+            width: `${Math.max(2, pct)}%`,
+            background: 'var(--mantine-color-cyan-5)',
+            borderRadius: 3,
+            transition: 'width 200ms ease',
+          }}
+        />
+      </Box>
+    </div>
+  );
 }
 
-interface FactorBase {
-  score: number;
-  weight: number;
-}
-
-interface EroticismFactor extends FactorBase {
-  breakdown: BreakdownItem[];
-}
-
-interface ClipSexinessFactor extends FactorBase {
-  available: boolean;
-  top_prompts?: ClipPrompt[];
-}
-
-interface ImageQualityFactor extends FactorBase {
-  resolution: number;
-  sharpness: number;
-  brightness: number;
-  contrast: number;
-}
-
-interface CompositionFactor extends FactorBase {
-  has_face: boolean;
-  aspect_ratio: number;
-  centering: number;
-  pose?: { score: number; details: string };
-}
-
-interface AestheticsFactor extends FactorBase {
-  saturation: number;
-  color_variety: number;
-  noise_level: number;
-}
-
-interface RatingFactors {
-  eroticism: EroticismFactor;
-  clip_sexiness: ClipSexinessFactor;
-  image_quality: ImageQualityFactor;
-  composition: CompositionFactor;
-  aesthetics: AestheticsFactor;
-}
-
-interface AgeAttractiveFactor extends FactorBase {
-  estimated_age?: number;
-  available?: boolean;
-}
-
-interface Rating {
-  score: number;
-  category: string;
-  description: string;
-  factors: RatingFactors & { age_attractiveness?: AgeAttractiveFactor };
-  age?: AgeAnalysis;
-  deepfake?: DeepfakeAnalysis;
-  clothing?: ClothingAnalysis;
-}
-
-interface Detection {
-  label: string;
-  score: number;
-  box?: number[];
-}
-
-interface RateMeResult {
-  models: string[];
-  rating: Rating;
-  detections: Detection[];
+/** Detection label with its bounding-box color as a dot (shared color map). */
+function LabelDot({ label }: { label: string }) {
+  return (
+    <Group gap={6} wrap="nowrap">
+      <Box w={7} h={7} style={{ borderRadius: 2, background: colorForLabel(label), flexShrink: 0 }} />
+      <Text className="data-mono" size="sm">
+        {label}
+      </Text>
+    </Group>
+  );
 }
 
 export default function RateMePage() {
-  const { authFetch } = useAuth();
+  const { keys, selectedKey, setSelectedKey, selectedKeyId, selectKey } = useApiKeys();
   const t = useTranslations('rateme');
   const tUpload = useTranslations('upload');
-  const tCommon = useTranslations('common');
   const fileRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
-  const [apiKey, setApiKey] = useState('');
-  const [selectedKeyId, setSelectedKeyId] = useState<string | null>(null);
-  const [apiKeys, setApiKeys] = useState<ApiKeyOption[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState<RateMeResult | null>(null);
   const [downloading, setDownloading] = useState(false);
-
-  useEffect(() => {
-    authFetch(`${AUTH_URL}/api-keys`)
-      .then((res) => (res.ok ? res.json() : Promise.reject()))
-      .then((data) => {
-        const keys: ApiKeyOption[] = (data.keys || data).map((k: any) => ({
-          id: k.id,
-          name: k.name,
-          key: k.key,
-          is_own: k.is_own ?? true,
-          is_master: k.is_master,
-        }));
-        setApiKeys(keys);
-        const ownKeys = keys.filter((k) => k.is_own && !k.key.endsWith('...'));
-        if (ownKeys.length >= 1) {
-          setSelectedKeyId(ownKeys[0].id);
-          setApiKey(ownKeys[0].key);
-        } else if (keys.length === 1) {
-          setSelectedKeyId(keys[0].id);
-        }
-      })
-      .catch(() => {});
-  }, [authFetch]);
 
   const handleDownloadResult = useCallback(async () => {
     if (!file || !result) return;
@@ -208,86 +131,55 @@ export default function RateMePage() {
   }, [file, result]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0] ?? null;
-    setFile(f);
+    setFile(e.target.files?.[0] ?? null);
     setResult(null);
     setError('');
   };
 
   const handleRate = useCallback(async () => {
-    if (!file || !apiKey.trim()) return;
+    if (!file || !selectedKey.trim()) return;
     setLoading(true);
     setError('');
     setResult(null);
-
     try {
       const formData = new FormData();
       formData.append('file', file);
-
       const res = await fetch(`${API_URL}/rateme`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${apiKey.trim()}` },
+        headers: { Authorization: `Bearer ${selectedKey.trim()}` },
         body: formData,
       });
-
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail || `Request failed (${res.status})`);
       }
-
-      const data: RateMeResult = await res.json();
-      setResult(data);
-    } catch (err: any) {
-      setError(err.message || 'Rating failed');
+      setResult((await res.json()) as RateMeResult);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Rating failed');
     } finally {
       setLoading(false);
     }
-  }, [file, apiKey]);
+  }, [file, selectedKey]);
 
   const scorePercent = result ? Math.round(result.rating.score * 100) : 0;
-  const categoryColor = result
-    ? CATEGORY_COLORS[result.rating.category] || 'gray'
-    : 'gray';
+  const categoryColor = result ? CATEGORY_COLORS[result.rating.category] || 'cyan' : 'cyan';
 
   return (
     <DashboardShell>
       <PageHeader title={t('title')} subtitle={t('subtitle')} />
 
-      <Paper withBorder p="lg" radius="md" mb="xl">
+      <Paper withBorder p="lg" mb="xl">
         <Stack>
           {/* API Key selection */}
-          <Paper withBorder p="sm" radius="md">
-            <Text size="sm" fw={500} mb={4}>
-              {tUpload('apiKey')} <Text span c="red">*</Text>
-            </Text>
-            <Select
-              placeholder={tUpload('selectKey')}
-              data={apiKeys.map((k) => ({
-                value: k.id,
-                label: `${k.name}${k.is_master ? ' [master]' : ''} — ${k.is_own && !k.key.endsWith('...') ? 'ready' : k.key}`,
-              }))}
-              value={selectedKeyId}
-              onChange={(val) => {
-                setSelectedKeyId(val);
-                const selected = apiKeys.find((k) => k.id === val);
-                if (selected && selected.is_own && !selected.key.endsWith('...')) {
-                  setApiKey(selected.key);
-                }
-              }}
-              clearable
-              mb="xs"
-            />
-            {selectedKeyId && apiKey && (
-              <Text size="xs" c="green" mb="xs">
-                API key auto-filled.
-              </Text>
-            )}
-            <TextInput
-              placeholder="Paste your full API key (ehk_...)"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.currentTarget.value)}
-            />
-          </Paper>
+          <ApiKeySelect
+            keys={keys}
+            selectedKey={selectedKey}
+            setSelectedKey={setSelectedKey}
+            selectedKeyId={selectedKeyId}
+            selectKey={selectKey}
+            label={tUpload('apiKey')}
+            placeholder={tUpload('selectKey')}
+          />
 
           {/* File picker */}
           <div>
@@ -302,15 +194,11 @@ export default function RateMePage() {
               style={{ display: 'none' }}
             />
             <Group>
-              <Button
-                variant="light"
-                leftSection={<IconFileUpload size={16} />}
-                onClick={() => fileRef.current?.click()}
-              >
+              <Button variant="light" leftSection={<IconFileUpload size={16} />} onClick={() => fileRef.current?.click()}>
                 {file ? 'Change file' : 'Choose file'}
               </Button>
               {file && (
-                <Text size="sm" c="dimmed">
+                <Text className="data-mono" size="sm" c="dimmed">
                   {file.name} ({(file.size / 1024).toFixed(1)} KB)
                 </Text>
               )}
@@ -325,7 +213,7 @@ export default function RateMePage() {
             leftSection={<IconStars size={16} />}
             onClick={handleRate}
             loading={loading}
-            disabled={!file || !apiKey.trim()}
+            disabled={!file || !selectedKey.trim()}
             fullWidth
           >
             Rate
@@ -335,12 +223,7 @@ export default function RateMePage() {
 
       {/* Error */}
       {error && (
-        <Alert
-          icon={<IconAlertCircle size={16} />}
-          color="red"
-          mb="xl"
-          title="Error"
-        >
+        <Alert icon={<IconAlertCircle size={16} />} color="block" mb="xl" title="Error">
           {error}
         </Alert>
       )}
@@ -349,36 +232,23 @@ export default function RateMePage() {
       {result && (
         <React.Fragment>
           {result.rating.category === 'blocked' && (
-            <Alert
-              icon={<IconAlertTriangle size={16} />}
-              color="red"
-              mb="xl"
-              title="Minor Detected"
-              variant="filled"
-            >
+            <Alert icon={<IconAlertTriangle size={16} />} color="block" mb="xl" title="Minor Detected" variant="filled">
               Minor detected — scoring disabled. This image has been flagged and the score was forced to 0.
             </Alert>
           )}
           <Group justify="flex-end" mb="md">
-            <Button
-              variant="light"
-              color="violet"
-              leftSection={<IconDownload size={16} />}
-              onClick={handleDownloadResult}
-              loading={downloading}
-            >
+            <Button variant="light" color="cyan" leftSection={<IconDownload size={16} />} onClick={handleDownloadResult} loading={downloading}>
               Download Result Image
             </Button>
           </Group>
+
           {/* Score + Category */}
-          <Paper withBorder p="lg" radius="md" mb="xl">
+          <Paper withBorder p="lg" mb="xl">
             <Group justify="space-between" mb="md">
-              <Text fw={600} fz="lg">
-                Rating Result
-              </Text>
+              <Eyebrow>Rating Result</Eyebrow>
               <Group gap="xs">
                 {result.models.map((m) => (
-                  <Badge key={m} variant="light" color="violet">
+                  <Badge key={m} className="data-mono" variant="light" color="cyan">
                     {m}
                   </Badge>
                 ))}
@@ -392,18 +262,13 @@ export default function RateMePage() {
                 roundCaps
                 sections={[{ value: scorePercent, color: categoryColor }]}
                 label={
-                  <Text ta="center" fw={700} fz="xl">
+                  <Text className="data-mono" ta="center" fw={700} fz={28}>
                     {scorePercent}%
                   </Text>
                 }
               />
               <Stack gap="xs" style={{ minWidth: 160 }}>
-                <Badge
-                  size="xl"
-                  color={categoryColor}
-                  variant="filled"
-                  radius="md"
-                >
+                <Badge className="data-mono" size="xl" color={categoryColor} variant="filled">
                   {result.rating.category}
                 </Badge>
                 <Text size="sm" c="dimmed">
@@ -413,45 +278,21 @@ export default function RateMePage() {
             </Group>
           </Paper>
 
-          {/* Factor bars */}
-          <Paper withBorder p="lg" radius="md" mb="xl">
-            <Text fw={600} fz="lg" mb="md">
-              Rating Factors
-            </Text>
-            <Stack gap="sm">
+          {/* Factor meters */}
+          <Paper withBorder p="lg" mb="xl">
+            <Eyebrow>Rating Factors</Eyebrow>
+            <Stack gap="md">
               {Object.entries(result.rating.factors).map(([key, factor]) => (
-                <div key={key}>
-                  <Group justify="space-between" mb={4}>
-                    <Text size="sm" fw={500}>
-                      {FACTOR_LABELS[key] || key}
-                    </Text>
-                    <Group gap="xs">
-                      <Text size="xs" c="dimmed">
-                        weight: {factor.weight}
-                      </Text>
-                      <Text size="sm" fw={600}>
-                        {Math.round(factor.score * 100)}%
-                      </Text>
-                    </Group>
-                  </Group>
-                  <Progress
-                    value={factor.score * 100}
-                    color={FACTOR_COLORS[key] || 'gray'}
-                    size="md"
-                    radius="xl"
-                  />
-                </div>
+                <Meter key={key} label={FACTOR_LABELS[key] || key} value={factor.score} weight={factor.weight} />
               ))}
             </Stack>
           </Paper>
 
           {/* Eroticism breakdown table */}
           {result.rating.factors.eroticism.breakdown.length > 0 && (
-            <Paper withBorder p="lg" radius="md" mb="xl">
-              <Text fw={600} fz="lg" mb="md">
-                Eroticism Breakdown
-              </Text>
-              <Table striped highlightOnHover>
+            <Paper withBorder p="lg" mb="xl">
+              <Eyebrow>Eroticism Breakdown</Eyebrow>
+              <Table highlightOnHover>
                 <Table.Thead>
                   <Table.Tr>
                     <Table.Th>Label</Table.Th>
@@ -464,20 +305,22 @@ export default function RateMePage() {
                   {result.rating.factors.eroticism.breakdown.map((item, idx) => (
                     <Table.Tr key={idx}>
                       <Table.Td>
-                        <Badge variant="light" size="sm">
-                          {item.label}
-                        </Badge>
+                        <LabelDot label={item.label} />
                       </Table.Td>
                       <Table.Td>
-                        <Text size="sm">
+                        <Text className="data-mono" size="sm">
                           {(item.confidence * 100).toFixed(1)}%
                         </Text>
                       </Table.Td>
                       <Table.Td>
-                        <Text size="sm">{item.weight.toFixed(2)}</Text>
+                        <Text className="data-mono" size="sm">
+                          {item.weight.toFixed(2)}
+                        </Text>
                       </Table.Td>
                       <Table.Td>
-                        <Text size="sm">{item.contribution.toFixed(3)}</Text>
+                        <Text className="data-mono" size="sm">
+                          {item.contribution.toFixed(3)}
+                        </Text>
                       </Table.Td>
                     </Table.Tr>
                   ))}
@@ -487,34 +330,20 @@ export default function RateMePage() {
           )}
 
           {/* CLIP Sexiness */}
-          <Paper withBorder p="lg" radius="md" mb="xl">
-            <Text fw={600} fz="lg" mb="md">
-              CLIP Sexiness
-            </Text>
+          <Paper withBorder p="lg" mb="xl">
+            <Eyebrow>CLIP Sexiness</Eyebrow>
             {!result.rating.factors.clip_sexiness.available ? (
-              <Alert
-                icon={<IconAlertCircle size={16} />}
-                color="yellow"
-                variant="light"
-              >
+              <Alert icon={<IconAlertCircle size={16} />} color="flag" variant="light">
                 CLIP model is unavailable for this analysis.
               </Alert>
             ) : result.rating.factors.clip_sexiness.top_prompts &&
               result.rating.factors.clip_sexiness.top_prompts.length > 0 ? (
               <Group gap="xs" wrap="wrap">
-                {result.rating.factors.clip_sexiness.top_prompts.map(
-                  (p, idx) => (
-                    <Badge
-                      key={idx}
-                      variant="light"
-                      color="violet"
-                      size="lg"
-                      radius="md"
-                    >
-                      {p.prompt} ({Math.round(p.similarity * 100)}%)
-                    </Badge>
-                  )
-                )}
+                {result.rating.factors.clip_sexiness.top_prompts.map((p, idx) => (
+                  <Badge key={idx} className="data-mono" variant="light" color="cyan" size="lg">
+                    {p.prompt} ({Math.round(p.similarity * 100)}%)
+                  </Badge>
+                ))}
               </Group>
             ) : (
               <Text size="sm" c="dimmed">
@@ -524,27 +353,22 @@ export default function RateMePage() {
           </Paper>
 
           {/* Image Quality details */}
-          <Paper withBorder p="lg" radius="md" mb="xl">
-            <Text fw={600} fz="lg" mb="md">
-              Image Quality
-            </Text>
-            <SimpleGrid cols={4}>
+          <Paper withBorder p="lg" mb="xl">
+            <Eyebrow>Image Quality</Eyebrow>
+            <SimpleGrid cols={{ base: 2, xs: 4 }}>
               {(
                 [
                   ['Resolution', result.rating.factors.image_quality.resolution],
                   ['Sharpness', result.rating.factors.image_quality.sharpness],
-                  [
-                    'Brightness',
-                    result.rating.factors.image_quality.brightness,
-                  ],
+                  ['Brightness', result.rating.factors.image_quality.brightness],
                   ['Contrast', result.rating.factors.image_quality.contrast],
                 ] as [string, number][]
               ).map(([label, value]) => (
                 <Stack key={label} gap={2} ta="center">
-                  <Text size="xs" c="dimmed" tt="uppercase">
+                  <Text className="data-mono" fz={10} c="dimmed" tt="uppercase" lts={1}>
                     {label}
                   </Text>
-                  <Text fw={700} fz="lg">
+                  <Text className="data-mono" fw={600} fz={26}>
                     {Math.round(value * 100)}%
                   </Text>
                 </Stack>
@@ -553,32 +377,22 @@ export default function RateMePage() {
           </Paper>
 
           {/* Composition */}
-          <Paper withBorder p="lg" radius="md" mb="xl">
-            <Text fw={600} fz="lg" mb="md">
-              Composition
-            </Text>
+          <Paper withBorder p="lg" mb="xl">
+            <Eyebrow>Composition</Eyebrow>
             <Group gap="md" wrap="wrap">
-              <Badge
-                variant="light"
-                color={
-                  result.rating.factors.composition.has_face ? 'green' : 'gray'
-                }
-                size="lg"
-              >
-                {result.rating.factors.composition.has_face
-                  ? 'Face detected'
-                  : 'No face detected'}
+              <Badge variant="light" color={result.rating.factors.composition.has_face ? 'allow' : 'gray'} size="lg">
+                {result.rating.factors.composition.has_face ? 'Face detected' : 'No face detected'}
               </Badge>
-              <Badge variant="light" color="teal" size="lg">
+              <Badge className="data-mono" variant="light" color="cyan" size="lg">
                 Aspect ratio: {result.rating.factors.composition.aspect_ratio.toFixed(2)}
               </Badge>
-              <Badge variant="light" color="teal" size="lg">
+              <Badge className="data-mono" variant="light" color="cyan" size="lg">
                 Centering: {Math.round(result.rating.factors.composition.centering * 100)}%
               </Badge>
             </Group>
             {result.rating.factors.composition.pose && (
               <Stack gap={4} mt="md">
-                <Text size="sm" fw={500}>
+                <Text className="data-mono" size="sm" fw={500}>
                   Pose: {Math.round(result.rating.factors.composition.pose.score * 100)}%
                 </Text>
                 <Text size="sm" c="dimmed">
@@ -589,19 +403,13 @@ export default function RateMePage() {
           </Paper>
 
           {/* CLIP Analysis Cards */}
-          <ClipAnalysisCards
-            age={result.rating.age}
-            deepfake={result.rating.deepfake}
-            clothing={result.rating.clothing}
-          />
+          <ClipAnalysisCards age={result.rating.age} deepfake={result.rating.deepfake} clothing={result.rating.clothing} />
 
           {/* Detections table */}
           {result.detections.length > 0 && (
-            <Paper withBorder p="lg" radius="md" mb="xl">
-              <Text fw={600} fz="lg" mb="md">
-                Detections
-              </Text>
-              <Table striped highlightOnHover>
+            <Paper withBorder p="lg" mb="xl">
+              <Eyebrow>Detections</Eyebrow>
+              <Table highlightOnHover>
                 <Table.Thead>
                   <Table.Tr>
                     <Table.Th>Label</Table.Th>
@@ -613,20 +421,16 @@ export default function RateMePage() {
                   {result.detections.map((det, idx) => (
                     <Table.Tr key={idx}>
                       <Table.Td>
-                        <Badge variant="light" size="sm">
-                          {det.label}
-                        </Badge>
+                        <LabelDot label={det.label} />
                       </Table.Td>
                       <Table.Td>
-                        <Text size="sm">
+                        <Text className="data-mono" size="sm">
                           {(det.score * 100).toFixed(1)}%
                         </Text>
                       </Table.Td>
                       <Table.Td>
-                        <Text size="xs" c="dimmed" ff="monospace">
-                          {det.box
-                            ? det.box.map((v) => v.toFixed(0)).join(', ')
-                            : '--'}
+                        <Text className="data-mono" size="xs" c="dimmed">
+                          {det.box ? det.box.map((v) => v.toFixed(0)).join(', ') : '--'}
                         </Text>
                       </Table.Td>
                     </Table.Tr>

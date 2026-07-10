@@ -1,0 +1,40 @@
+# Deployment override for nexas (Traefik reverse proxy via file provider).
+#
+# Strips host port publishing (Traefik routes via container network) and
+# joins api/auth/studio to the external `traefik-net` network so the
+# existing Traefik on nexas can reach them by container name.
+#
+# Usage on nexas:
+#   docker compose -f docker-compose.yml -f docker-compose.deploy.yml up -d
+
+services:
+  db:
+    container_name: nudedetectapi-db
+
+  redis:
+    container_name: nudedetectapi-redis
+
+  auth:
+    container_name: nudedetectapi-auth
+    ports: !reset []
+    networks:
+      - default
+      - traefik-net
+
+  api:
+    container_name: nudedetectapi-api
+    ports: !reset []
+    networks:
+      - default
+      - traefik-net
+
+  studio:
+    container_name: nudedetectapi-studio
+    ports: !reset []
+    networks:
+      - default
+      - traefik-net
+
+networks:
+  traefik-net:
+    external: true

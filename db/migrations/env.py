@@ -8,7 +8,18 @@ from sqlalchemy import create_engine, pool
 from alembic import context
 
 from db.src.database import Base
-from auth.src.models import Tenant, User, APIKey, WebhookEndpoint, WebhookDelivery  # noqa: F401 — register models
+from auth.src.models import (  # noqa: F401 — register all models so target_metadata is complete
+    Tenant,
+    User,
+    APIKey,
+    UsageLog,
+    DetectionResult,
+    DetectionCache,
+    DemoLog,
+    WebhookEndpoint,
+    WebhookDelivery,
+    AsyncJob,
+)
 
 config = context.config
 
@@ -21,7 +32,7 @@ target_metadata = Base.metadata
 _root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./db/data/auth.db")
 # Alembic uses sync drivers
-SYNC_URL = DATABASE_URL.replace("+aiosqlite", "").replace("+asyncpg", "+psycopg2")
+SYNC_URL = DATABASE_URL.replace("+aiosqlite", "").replace("+asyncpg", "+psycopg")
 if SYNC_URL.startswith("sqlite:///./"):
     rel_path = SYNC_URL.replace("sqlite:///./", "")
     SYNC_URL = f"sqlite:///{os.path.join(_root, rel_path)}"

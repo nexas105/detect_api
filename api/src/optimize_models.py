@@ -17,6 +17,10 @@ from pathlib import Path
 
 MODEL_DIR = Path(os.getenv("MODEL_DIR", os.path.expanduser("~/.nudenet_api/models")))
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
+ERAX_MODEL_SIZE = os.getenv("ERAX_MODEL_SIZE", "m").strip().lower()
+if ERAX_MODEL_SIZE not in {"n", "s", "m"}:
+    raise ValueError("ERAX_MODEL_SIZE must be one of: n, s, m")
+ERAX_MODEL_STEM = f"erax-anti-nsfw-yolo11{ERAX_MODEL_SIZE}-v1.1"
 
 
 def _quantize_onnx(input_path: Path, output_path: Path) -> bool:
@@ -41,8 +45,8 @@ def _quantize_onnx(input_path: Path, output_path: Path) -> bool:
 def optimize_erax():
     """Export EraX YOLO to ONNX (no quantization)."""
     print("\n[EraX] Converting to ONNX...")
-    pt_path = MODEL_DIR / "erax-anti-nsfw-yolo11s-v1.1.pt"
-    onnx_path = MODEL_DIR / "erax-anti-nsfw-yolo11s-v1.1.onnx"
+    pt_path = MODEL_DIR / f"{ERAX_MODEL_STEM}.pt"
+    onnx_path = MODEL_DIR / f"{ERAX_MODEL_STEM}.onnx"
 
     if onnx_path.exists():
         print(f"  Already converted: {onnx_path}")

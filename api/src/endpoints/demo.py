@@ -56,7 +56,7 @@ async def demo_classify(
     limiting (10 images/hour), and a 10MB file size cap. Results are stored
     under the demo system account.
     """
-    demo_limiter.check_image(request)
+    await demo_limiter.check_image(request)
     data = await file.read()
     validate_upload(data, max_size=10 * 1024 * 1024)
 
@@ -71,7 +71,7 @@ async def demo_classify(
 
     return {
         "model": model.value, "detections": detections, "image_id": image_id,
-        "demo": True, "limits": demo_limiter.get_remaining(request),
+        "demo": True, "limits": await demo_limiter.get_remaining(request),
     }
 
 
@@ -86,7 +86,7 @@ async def demo_batch(
     Same as /batch but with demo limits: max 10 images per archive,
     1 archive per hour per IP, and 50MB file size cap.
     """
-    demo_limiter.check_archive(request)
+    await demo_limiter.check_archive(request)
     data = await file.read()
     validate_upload(data, max_size=50 * 1024 * 1024)
 
@@ -122,7 +122,7 @@ async def demo_batch(
         "model": model.value, "total": len(images),
         "processed": processed,
         "results": results, "demo": True,
-        "limits": demo_limiter.get_remaining(request),
+        "limits": await demo_limiter.get_remaining(request),
     }
 
 
@@ -133,7 +133,7 @@ async def demo_limits(request: Request):
     Returns the number of remaining image and archive requests, plus the
     time until the rate limit window resets (3600 seconds).
     """
-    return demo_limiter.get_remaining(request)
+    return await demo_limiter.get_remaining(request)
 
 
 @router.get("/admin/usage", response_model=DemoAdminUsageResponse, tags=["System"])
@@ -143,4 +143,4 @@ async def demo_admin_usage():
     Returns per-IP usage data for all active demo users including request
     counts and timestamps.
     """
-    return {"demo_users": demo_limiter.get_all_usage()}
+    return {"demo_users": await demo_limiter.get_all_usage()}

@@ -4,26 +4,7 @@
  * on top, dark info panel below with score, detections, and metadata.
  */
 
-const LABEL_COLORS: Record<string, string> = {
-  // Red — explicit exposed
-  FEMALE_BREAST_EXPOSED: '#ef4444',
-  FEMALE_GENITALIA_EXPOSED: '#dc2626',
-  MALE_GENITALIA_EXPOSED: '#dc2626',
-  BUTTOCKS_EXPOSED: '#ef4444',
-  ANUS_EXPOSED: '#dc2626',
-  NIPPLE: '#ef4444',
-  VAGINA: '#dc2626',
-  PENIS: '#dc2626',
-  MAKE_LOVE: '#991b1b',
-  // Orange — covered
-  FEMALE_BREAST_COVERED: '#f97316',
-  BUTTOCKS_COVERED: '#f97316',
-  // Blue — face
-  FACE_FEMALE: '#3b82f6',
-  FACE_MALE: '#3b82f6',
-};
-
-const DEFAULT_COLOR = '#a855f7';
+import { boxLineWidth, colorForLabel, loadImage, modelTag } from './detection-draw';
 
 const CATEGORY_COLORS: Record<string, string> = {
   safe: '#22c55e',
@@ -77,20 +58,6 @@ interface ClassifyResultData {
   clothing?: { clothing: string; exposure_level: number; available: boolean };
 }
 
-function getLabelColor(label: string): string {
-  return LABEL_COLORS[label] || DEFAULT_COLOR;
-}
-
-function loadImage(file: File): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = reject;
-    const url = URL.createObjectURL(file);
-    img.src = url;
-  });
-}
-
 function roundRect(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -122,17 +89,16 @@ function drawDetectionBoxes(
   for (const det of detections) {
     if (!det.box || det.box.length < 4) continue;
     const [x, y, w, h] = det.box;
-    const color = getLabelColor(det.label);
+    const color = colorForLabel(det.label);
 
     // Draw box
     ctx.strokeStyle = color;
-    ctx.lineWidth = Math.max(2, Math.round(Math.min(imgWidth, imgHeight) / 200));
+    ctx.lineWidth = boxLineWidth(imgWidth, imgHeight);
     ctx.strokeRect(x, offsetY + y, w, h);
 
     // Draw label background
     const scoreText = `${Math.round(det.score * 100)}%`;
-    const modelTag = det.model ? ` [${det.model === 'nudenet' ? 'NN' : 'EX'}]` : '';
-    const labelText = `${det.label} ${scoreText}${modelTag}`;
+    const labelText = `${det.label} ${scoreText}${modelTag(det.model)}`;
     const fontSize = Math.max(12, Math.round(Math.min(imgWidth, imgHeight) / 50));
     ctx.font = `bold ${fontSize}px sans-serif`;
     const textMetrics = ctx.measureText(labelText);
@@ -342,7 +308,7 @@ export async function generateResultImage(
 
     const visibleDets = detections.slice(0, 15);
     for (const det of visibleDets) {
-      const color = getLabelColor(det.label);
+      const color = colorForLabel(det.label);
       const dotY = curY + 10;
 
       // Colored dot
@@ -354,8 +320,7 @@ export async function generateResultImage(
       // Label text
       ctx.fillStyle = '#ffffff';
       ctx.font = '14px sans-serif';
-      const modelTag = det.model ? ` [${det.model === 'nudenet' ? 'NN' : 'EX'}]` : '';
-      const labelStr = `${det.label}${modelTag}`;
+      const labelStr = `${det.label}${modelTag(det.model)}`;
       ctx.fillText(labelStr, pad + 20, dotY + 5);
 
       // Score percentage (right-aligned)

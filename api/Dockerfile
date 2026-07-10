@@ -11,6 +11,28 @@ COPY api/requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt
 
+# GPU build: replace CPU-pinned torch/torchvision (from requirements.txt) with the
+# CUDA build, and swap onnxruntime (pulled in by nudenet) for onnxruntime-gpu so
+# NudeNet runs on CUDA too. Default is CPU — the docker-compose.gpu.yml override
+# sets TORCH_VARIANT=cuda and the LD_LIBRARY_PATH that lets onnxruntime-gpu find
+# the CUDA/cuDNN libs bundled by the CUDA torch wheel.
+# TORCH_CUDA_INDEX optionally pins a torch channel (e.g.
+# https://download.pytorch.org/whl/cu124); empty = default PyPI CUDA wheels.
+# NOTE: onnxruntime-gpu's cuDNN/CUDA major must match what the torch wheel bundles
+# (recent torch = CUDA 12 / cuDNN 9). Verify on a real GPU host — this cannot be
+# validated in a CPU build.
+ARG TORCH_VARIANT=cpu
+ARG TORCH_CUDA_INDEX=
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$TORCH_VARIANT" = "cuda" ]; then \
+      if [ -n "$TORCH_CUDA_INDEX" ]; then \
+        pip install --force-reinstall torch==2.11.0 torchvision==0.26.0 --index-url "$TORCH_CUDA_INDEX"; \
+      else \
+        pip install --force-reinstall torch==2.11.0 torchvision==0.26.0; \
+      fi; \
+      pip uninstall -y onnxruntime && pip install onnxruntime-gpu; \
+    fi
+
 # Download 640m model via GitHub API (direct link broken, API still works)
 RUN mkdir -p /root/.NudeNet && \
     curl -L -H "Accept: application/octet-stream" \

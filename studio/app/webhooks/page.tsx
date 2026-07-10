@@ -24,6 +24,7 @@ import {
   IconHistory,
   IconPencil,
   IconPlus,
+  IconRefresh,
   IconSend,
   IconTrash,
   IconWebhook,
@@ -115,6 +116,7 @@ export default function WebhooksPage() {
   });
   const [secretModal, setSecretModal] = useState<{ secret: string; hookName: string } | null>(null);
   const [deliveriesFor, setDeliveriesFor] = useState<{ hook: Webhook; items: Delivery[] } | null>(null);
+  const [deliveriesLoading, setDeliveriesLoading] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; status: number | null; body: string | null } | null>(null);
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
@@ -234,13 +236,22 @@ export default function WebhooksPage() {
     }
   };
 
-  const handleShowDeliveries = async (h: Webhook) => {
-    const res = await authFetch(`${AUTH_URL}/webhooks/${h.id}/deliveries`);
-    if (res.ok) {
-      const data = await res.json();
-      setDeliveriesFor({ hook: h, items: data.deliveries || [] });
-      openDeliveries();
+  const loadDeliveries = useCallback(async (h: Webhook) => {
+    setDeliveriesLoading(true);
+    try {
+      const res = await authFetch(`${AUTH_URL}/webhooks/${h.id}/deliveries`);
+      if (res.ok) {
+        const data = await res.json();
+        setDeliveriesFor({ hook: h, items: data.deliveries || [] });
+      }
+    } finally {
+      setDeliveriesLoading(false);
     }
+  }, [authFetch]);
+
+  const handleShowDeliveries = async (h: Webhook) => {
+    await loadDeliveries(h);
+    openDeliveries();
   };
 
   return (
@@ -506,9 +517,20 @@ export default function WebhooksPage() {
         opened={deliveriesOpened}
         onClose={closeDeliveries}
         title={`Deliveries — ${deliveriesFor?.hook.name ?? ''}`}
-        size="lg"
+        size="xl"
         centered
       >
+        <Group justify="flex-end" mb="sm">
+          <Button
+            size="xs"
+            variant="light"
+            leftSection={<IconRefresh size={14} />}
+            loading={deliveriesLoading}
+            onClick={() => deliveriesFor && loadDeliveries(deliveriesFor.hook)}
+          >
+            {tCommon('refresh')}
+          </Button>
+        </Group>
         {deliveriesFor && deliveriesFor.items.length === 0 ? (
           <Text c="dimmed">No deliveries yet.</Text>
         ) : (
@@ -519,6 +541,7 @@ export default function WebhooksPage() {
                 <Table.Th>Event</Table.Th>
                 <Table.Th>Status</Table.Th>
                 <Table.Th>Attempt</Table.Th>
+                <Table.Th>Next Retry</Table.Th>
                 <Table.Th>Response</Table.Th>
               </Table.Tr>
             </Table.Thead>
@@ -526,17 +549,22 @@ export default function WebhooksPage() {
               {deliveriesFor?.items.map((d) => (
                 <Table.Tr key={d.id}>
                   <Table.Td>
-                    <Text size="xs">{new Date(d.created_at).toLocaleString()}</Text>
+                    <Text className="data-mono" size="xs">{new Date(d.created_at).toLocaleString()}</Text>
                   </Table.Td>
                   <Table.Td>
-                    <Code>{d.event_type}</Code>
+                    <Code className="data-mono">{d.event_type}</Code>
                   </Table.Td>
                   <Table.Td>
-                    <Badge color={d.succeeded ? 'teal' : 'red'}>
+                    <Badge color={d.succeeded ? 'allow' : 'block'}>
                       {d.response_status ?? 'err'}
                     </Badge>
                   </Table.Td>
-                  <Table.Td>{d.attempt}</Table.Td>
+                  <Table.Td className="data-mono">{d.attempt}</Table.Td>
+                  <Table.Td>
+                    <Text className="data-mono" size="xs" c={d.next_retry_at ? undefined : 'dimmed'}>
+                      {d.next_retry_at ? new Date(d.next_retry_at).toLocaleString() : '—'}
+                    </Text>
+                  </Table.Td>
                   <Table.Td>
                     <Code style={{ maxWidth: 300, display: 'inline-block', wordBreak: 'break-all' }}>
                       {(d.response_body ?? '').slice(0, 200)}

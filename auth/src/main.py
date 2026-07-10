@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,10 +19,12 @@ from .auth import (
     create_refresh_token,
     decode_token,
     generate_api_key,
+    hash_api_key,
     hash_password,
     verify_password,
 )
 from db.src.database import get_db, init_db
+from db.src.webhook_security import validate_webhook_url
 from .models import APIKey, DemoLog, DetectionResult, Plan, PLAN_LIMITS, Role, Tenant, UsageLog, User, WebhookDelivery, WebhookEndpoint, WebhookTrigger
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -63,13 +65,22 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Auth Service", version="1.0.0", lifespan=lifespan)
 
-# Always enable CORS — if no explicit origins configured, allow all origins.
+# CORS: a wildcard origin together with credentials is unsafe (and rejected by
+# browsers anyway). Only enable credentials when concrete origins/regex are
+# configured; otherwise fall back to an anonymous wildcard.
 # In production set CORS_ORIGINS to the Studio domain(s).
+if CORS_ORIGINS or CORS_ORIGIN_REGEX:
+    _cors_allow_origins = CORS_ORIGINS
+    _cors_allow_credentials = True
+else:
+    _cors_allow_origins = ["*"]
+    _cors_allow_credentials = False
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS or ["*"],
+    allow_origins=_cors_allow_origins,
     allow_origin_regex=CORS_ORIGIN_REGEX,
-    allow_credentials=True,
+    allow_credentials=_cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -82,7 +93,7 @@ _bearer = HTTPBearer()
 
 class RegisterRequest(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(min_length=8, description="Password must be at least 8 characters")
     tenant_name: str | None = None
 
 
@@ -129,7 +140,7 @@ class RoleUpdate(BaseModel):
 
 class CreateUserRequest(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(min_length=8, description="Password must be at least 8 characters")
     role: Role = Role.user
     tenant_id: str | None = None  # super admin can assign to any tenant
 
@@ -168,7 +179,7 @@ async def _ensure_default_tenant():
 
 async def _ensure_demo_account():
     """Seed a 'demo' tenant + user + API key. All demo requests use this account."""
-    from .auth import generate_api_key
+    from .auth import generate_api_key, hash_api_key
     from db.src.database import async_session
 
     async with async_session() as db:
@@ -193,14 +204,22 @@ async def _ensure_demo_account():
             db.add(demo_user)
             await db.flush()
 
-        # API key (reuse existing if active)
+        # API key. Plaintext is never stored, so it can't be recovered from an
+        # existing row — (re)generate a raw key each startup and keep it only in
+        # memory (_demo_api_key), persisting just its hash. Reuses the existing
+        # row if present, otherwise creates one.
+        # ponytail: rotates the demo key on every auth restart; harmless because
+        # it's an internal system key the API service re-fetches lazily.
+        raw = generate_api_key()
         result = await db.execute(
             select(APIKey).where(APIKey.tenant_id == tenant.id, APIKey.name == "demo-system-key", APIKey.is_active == True)
         )
         demo_key = result.scalar_one_or_none()
         if not demo_key:
             demo_key = APIKey(
-                key=generate_api_key(),
+                key=None,
+                key_hash=hash_api_key(raw),
+                key_prefix=raw[:8],
                 name="demo-system-key",
                 tenant_id=tenant.id,
                 created_by=demo_user.id,
@@ -208,11 +227,14 @@ async def _ensure_demo_account():
                 rate_limit=100,  # shared limit across all demo users
             )
             db.add(demo_key)
+        else:
+            demo_key.key = None
+            demo_key.key_hash = hash_api_key(raw)
+            demo_key.key_prefix = raw[:8]
 
         await db.commit()
-        await db.refresh(demo_key)
-        print(f"Demo account ready: key={demo_key.key[:8]}...")
-        return demo_key.key
+        print(f"Demo account ready: key={raw[:8]}...")
+        return raw
 
 
 # Store the demo key for the API service to use
@@ -263,6 +285,14 @@ def _require_role(*roles: Role):
             raise HTTPException(status.HTTP_403_FORBIDDEN, f"Requires role: {', '.join(r.value for r in roles)}")
         return user
     return check
+
+
+async def _require_super_admin(admin: User = Depends(_require_role(Role.admin)), db: AsyncSession = Depends(get_db)) -> User:
+    """Admin in the 'default' tenant (super admin). Returns the admin user."""
+    admin_tenant = await db.get(Tenant, admin.tenant_id)
+    if admin_tenant.name != "default":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super admin required")
+    return admin
 
 
 async def _get_tenant_limits(db: AsyncSession, tenant_id: str) -> dict:
@@ -435,7 +465,10 @@ async def create_api_key(
 
     key = generate_api_key()
     api_key = APIKey(
-        key=key, name=req.name,
+        key=None,  # plaintext returned once below, never persisted
+        key_hash=hash_api_key(key),
+        key_prefix=key[:8],
+        name=req.name,
         tenant_id=user.tenant_id, created_by=user.id,
         is_master=req.is_master,
         rate_limit=limits["rate_limit"],
@@ -455,15 +488,20 @@ async def create_api_key(
 async def list_api_keys(
     user: User = Depends(_get_current_user),
     db: AsyncSession = Depends(get_db),
+    limit: int | None = Query(None, ge=1),
+    offset: int = Query(0, ge=0),
 ):
     # Users see: their own keys + master keys in their tenant
-    result = await db.execute(
-        select(APIKey).where(
-            APIKey.tenant_id == user.tenant_id,
-            APIKey.is_active == True,
-        )
+    stmt = select(APIKey).where(
+        APIKey.tenant_id == user.tenant_id,
+        APIKey.is_active == True,
     )
-    keys = result.scalars().all()
+    # ponytail: limit/offset applied in SQL, before the non-admin Python
+    # own+master filter below — a page may thus return < limit rows for
+    # non-admins. Default (None) keeps the current "return all" behavior.
+    if limit is not None:
+        stmt = stmt.limit(limit).offset(offset)
+    keys = (await db.execute(stmt)).scalars().all()
     # Non-admins only see their own personal keys + all master keys
     if user.role != Role.admin:
         keys = [k for k in keys if k.is_master or k.created_by == user.id]
@@ -472,7 +510,8 @@ async def list_api_keys(
         "keys": [
             {
                 "id": k.id, "name": k.name,
-                "key": k.key if k.created_by == user.id else k.key[:8] + "...",
+                # Plaintext is no longer stored — only ever expose the prefix.
+                "key": (k.key_prefix or "") + "…",
                 "is_master": k.is_master, "rate_limit": k.rate_limit,
                 "created_at": k.created_at.isoformat(),
                 "is_own": k.created_by == user.id,
@@ -516,7 +555,7 @@ async def validate_api_key(
     NOT in the URL path so it doesn't end up in proxy access logs.
     """
     key = credentials.credentials
-    result = await db.execute(select(APIKey).where(APIKey.key == key, APIKey.is_active == True))
+    result = await db.execute(select(APIKey).where(APIKey.key_hash == hash_api_key(key), APIKey.is_active == True))
     api_key = result.scalar_one_or_none()
     if not api_key:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid API key")
@@ -572,9 +611,13 @@ async def list_plans():
 async def list_users(
     user: User = Depends(_require_role(Role.admin)),
     db: AsyncSession = Depends(get_db),
+    limit: int | None = Query(None, ge=1),
+    offset: int = Query(0, ge=0),
 ):
-    result = await db.execute(select(User).where(User.tenant_id == user.tenant_id))
-    users = result.scalars().all()
+    stmt = select(User).where(User.tenant_id == user.tenant_id)
+    if limit is not None:
+        stmt = stmt.limit(limit).offset(offset)
+    users = (await db.execute(stmt)).scalars().all()
     return {
         "users": [
             UserResponse(
@@ -704,14 +747,9 @@ async def delete_user(
 async def move_user_to_tenant(
     user_id: str,
     tenant_id: str = Query(...),
-    admin: User = Depends(_require_role(Role.admin)),
+    admin: User = Depends(_require_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    # Only super admin can move users between tenants
-    admin_tenant = await db.get(Tenant, admin.tenant_id)
-    if admin_tenant.name != "default":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only super admins can move users")
-
     target = await db.get(User, user_id)
     if not target:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
@@ -731,14 +769,9 @@ async def move_user_to_tenant(
 async def update_tenant_plan(
     tenant_id: str,
     req: PlanUpdate,
-    admin: User = Depends(_require_role(Role.admin)),
+    admin: User = Depends(_require_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    # Only default tenant admins (super admins) can change plans
-    admin_tenant = await db.get(Tenant, admin.tenant_id)
-    if admin_tenant.name != "default":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only super admins can change tenant plans")
-
     tenant = await db.get(Tenant, tenant_id)
     if not tenant:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Tenant not found")
@@ -749,42 +782,44 @@ async def update_tenant_plan(
 
 @app.get("/admin/tenants")
 async def list_tenants(
-    admin: User = Depends(_require_role(Role.admin)),
+    admin: User = Depends(_require_super_admin),
     db: AsyncSession = Depends(get_db),
+    limit: int | None = Query(None, ge=1),
+    offset: int = Query(0, ge=0),
 ):
-    # Only default tenant admins can list all tenants
-    admin_tenant = await db.get(Tenant, admin.tenant_id)
-    if admin_tenant.name != "default":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only super admins can list tenants")
+    stmt = select(Tenant)
+    if limit is not None:
+        stmt = stmt.limit(limit).offset(offset)
+    tenants = (await db.execute(stmt)).scalars().all()
 
-    result = await db.execute(select(Tenant))
-    tenants = result.scalars().all()
-    out = []
-    for t in tenants:
-        uc = (await db.execute(
-            select(func.count()).select_from(User).where(User.tenant_id == t.id)
-        )).scalar()
-        kc = (await db.execute(
-            select(func.count()).select_from(APIKey).where(APIKey.tenant_id == t.id, APIKey.is_active == True)
-        )).scalar()
-        out.append(TenantResponse(
+    # Two aggregated GROUP BY queries instead of 2 COUNTs per tenant (N+1).
+    # ponytail: counts the full tables regardless of page — two queries total,
+    # fine at tenant scale; scope to page tenant ids only if it ever isn't.
+    user_counts = dict((await db.execute(
+        select(User.tenant_id, func.count()).group_by(User.tenant_id)
+    )).all())
+    key_counts = dict((await db.execute(
+        select(APIKey.tenant_id, func.count())
+        .where(APIKey.is_active == True).group_by(APIKey.tenant_id)
+    )).all())
+
+    out = [
+        TenantResponse(
             id=t.id, name=t.name, plan=t.plan.value, is_active=t.is_active,
-            user_count=uc, key_count=kc,
+            user_count=user_counts.get(t.id, 0), key_count=key_counts.get(t.id, 0),
             limits=t.effective_limits,
-        ).model_dump())
+        ).model_dump()
+        for t in tenants
+    ]
     return {"tenants": out}
 
 
 @app.post("/admin/tenants", response_model=TenantResponse)
 async def create_tenant(
     req: TenantCreateRequest,
-    admin: User = Depends(_require_role(Role.admin)),
+    admin: User = Depends(_require_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    admin_tenant = await db.get(Tenant, admin.tenant_id)
-    if admin_tenant.name != "default":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only super admins can create tenants")
-
     existing = await db.execute(select(Tenant).where(Tenant.name == req.name))
     if existing.scalar_one_or_none():
         raise HTTPException(status.HTTP_409_CONFLICT, "Tenant name already exists")
@@ -804,13 +839,9 @@ async def create_tenant(
 @app.delete("/admin/tenants/{tenant_id}")
 async def delete_tenant(
     tenant_id: str,
-    admin: User = Depends(_require_role(Role.admin)),
+    admin: User = Depends(_require_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    admin_tenant = await db.get(Tenant, admin.tenant_id)
-    if admin_tenant.name != "default":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only super admins can delete tenants")
-
     tenant = await db.get(Tenant, tenant_id)
     if not tenant:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Tenant not found")
@@ -847,13 +878,9 @@ class TenantUpdateRequest(BaseModel):
 async def update_tenant(
     tenant_id: str,
     req: TenantUpdateRequest,
-    admin: User = Depends(_require_role(Role.admin)),
+    admin: User = Depends(_require_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    admin_tenant = await db.get(Tenant, admin.tenant_id)
-    if admin_tenant.name != "default":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only super admins can update tenants")
-
     tenant = await db.get(Tenant, tenant_id)
     if not tenant:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Tenant not found")
@@ -886,15 +913,15 @@ async def update_tenant(
 
 @app.get("/admin/all-users")
 async def list_all_users(
-    admin: User = Depends(_require_role(Role.admin)),
+    admin: User = Depends(_require_super_admin),
     db: AsyncSession = Depends(get_db),
+    limit: int | None = Query(None, ge=1),
+    offset: int = Query(0, ge=0),
 ):
-    admin_tenant = await db.get(Tenant, admin.tenant_id)
-    if admin_tenant.name != "default":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only super admins can list all users")
-
-    result = await db.execute(select(User))
-    users = result.scalars().all()
+    stmt = select(User)
+    if limit is not None:
+        stmt = stmt.limit(limit).offset(offset)
+    users = (await db.execute(stmt)).scalars().all()
 
     # Get tenant names
     tenants_result = await db.execute(select(Tenant))
@@ -926,7 +953,7 @@ class UsageLogRequest(BaseModel):
 
 @app.post("/usage/log", dependencies=[Depends(_require_internal)])
 async def log_usage(req: UsageLogRequest, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(APIKey).where(APIKey.key == req.api_key))
+    result = await db.execute(select(APIKey).where(APIKey.key_hash == hash_api_key(req.api_key), APIKey.is_active == True))
     api_key = result.scalar_one_or_none()
     if not api_key:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "API key not found")
@@ -988,15 +1015,15 @@ async def usage_stats(
 
 @app.get("/usage/rate-state", dependencies=[Depends(_require_internal)])
 async def rate_state(db: AsyncSession = Depends(get_db)):
-    """Return per-key request counts for the last hour. Used by API service on startup to restore rate limit state."""
-    hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
-    result = await db.execute(
-        select(APIKey.key, func.count(UsageLog.id))
-        .join(UsageLog, UsageLog.api_key_id == APIKey.id)
-        .where(UsageLog.created_at >= hour_ago)
-        .group_by(APIKey.key)
-    )
-    return {"keys": {row[0]: row[1] for row in result.all()}}
+    """Return per-key request counts for the last hour. Used by API service on startup to restore rate limit state.
+
+    The API limiter keys buckets by the raw plaintext key, which we no longer
+    store, so this best-effort restore can no longer be reconstructed here and
+    returns nothing. Redis remains the primary source of live counts.
+    ponytail: dead restore until the API service keys its limiter by key_hash
+    (cross-service change, out of scope for auth-only); Redis covers the gap.
+    """
+    return {"keys": {}}
 
 
 # ── Detection Results (called by API service + queried by Studio) ───────────
@@ -1014,7 +1041,7 @@ class DetectionSaveRequest(BaseModel):
 
 @app.post("/detections", dependencies=[Depends(_require_internal)])
 async def save_detection(req: DetectionSaveRequest, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(APIKey).where(APIKey.key == req.api_key))
+    result = await db.execute(select(APIKey).where(APIKey.key_hash == hash_api_key(req.api_key), APIKey.is_active == True))
     api_key = result.scalar_one_or_none()
     if not api_key:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "API key not found")
@@ -1102,14 +1129,10 @@ async def log_demo_usage(req: DemoLogRequest, db: AsyncSession = Depends(get_db)
 
 @app.get("/demo/stats")
 async def demo_stats(
-    admin: User = Depends(_require_role(Role.admin)),
+    admin: User = Depends(_require_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Demo usage stats — super admin only."""
-    admin_tenant = await db.get(Tenant, admin.tenant_id)
-    if admin_tenant.name != "default":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only super admins can view demo stats")
-
     now = datetime.now(timezone.utc)
     hour_ago = now - timedelta(hours=1)
     day_ago = now - timedelta(days=1)
@@ -1150,17 +1173,12 @@ async def demo_stats(
 # ── Cross-Tenant Detail Views (super admin) ─────────────────────────────────
 
 
-async def _require_super_admin(admin: User = Depends(_require_role(Role.admin)), db: AsyncSession = Depends(get_db)) -> User:
-    admin_tenant = await db.get(Tenant, admin.tenant_id)
-    if admin_tenant.name != "default":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super admin required")
-    return admin
-
-
 @app.get("/admin/tenants/{tenant_id}/users")
-async def tenant_users(tenant_id: str, admin: User = Depends(_require_super_admin), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.tenant_id == tenant_id))
-    return {"users": [UserResponse(id=u.id, email=u.email, role=u.role.value, tenant_id=u.tenant_id, is_active=u.is_active).model_dump() for u in result.scalars().all()]}
+async def tenant_users(tenant_id: str, admin: User = Depends(_require_super_admin), db: AsyncSession = Depends(get_db), limit: int | None = Query(None, ge=1), offset: int = Query(0, ge=0)):
+    stmt = select(User).where(User.tenant_id == tenant_id)
+    if limit is not None:
+        stmt = stmt.limit(limit).offset(offset)
+    return {"users": [UserResponse(id=u.id, email=u.email, role=u.role.value, tenant_id=u.tenant_id, is_active=u.is_active).model_dump() for u in (await db.execute(stmt)).scalars().all()]}
 
 
 @app.get("/admin/tenants/{tenant_id}/usage")
@@ -1193,7 +1211,7 @@ async def tenant_detections(tenant_id: str, limit: int = Query(50, le=200), admi
 @app.get("/admin/tenants/{tenant_id}/keys")
 async def tenant_keys(tenant_id: str, admin: User = Depends(_require_super_admin), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(APIKey).where(APIKey.tenant_id == tenant_id, APIKey.is_active == True))
-    return {"keys": [{"id": k.id, "name": k.name, "key": k.key[:8] + "...", "is_master": k.is_master, "rate_limit": k.rate_limit,
+    return {"keys": [{"id": k.id, "name": k.name, "key": (k.key_prefix or "") + "…", "is_master": k.is_master, "rate_limit": k.rate_limit,
             "created_at": k.created_at.isoformat()} for k in result.scalars().all()]}
 
 
@@ -1212,7 +1230,7 @@ async def user_details(user_id: str, admin: User = Depends(_require_super_admin)
     return {
         "user": UserResponse(id=target.id, email=target.email, role=target.role.value, tenant_id=target.tenant_id, is_active=target.is_active).model_dump(),
         "tenant_name": tenant.name if tenant else None,
-        "keys": [{"id": k.id, "name": k.name, "key": k.key[:8] + "...", "is_master": k.is_master, "rate_limit": k.rate_limit} for k in keys],
+        "keys": [{"id": k.id, "name": k.name, "key": (k.key_prefix or "") + "…", "is_master": k.is_master, "rate_limit": k.rate_limit} for k in keys],
         "usage_24h": usage_24h,
         "detections": [{"id": d.id, "image_id": d.image_id, "endpoint": d.endpoint, "model_name": d.model_name,
                 "detections": json_mod.loads(d.detections_json), "original_path": d.original_path, "censored_path": d.censored_path,
@@ -1283,8 +1301,10 @@ async def create_webhook(
     user: User = Depends(_get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if not req.url.startswith(("http://", "https://")):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "URL must be http(s)")
+    try:
+        await validate_webhook_url(req.url)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     # Tenant-wide webhooks require admin
     if req.api_key_id is None and user.role != Role.admin:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only admins can create tenant-wide webhooks")
@@ -1333,8 +1353,10 @@ async def update_webhook(
 ):
     hook = await _resolve_webhook(webhook_id, user, db)
     if req.url is not None:
-        if not req.url.startswith(("http://", "https://")):
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "URL must be http(s)")
+        try:
+            await validate_webhook_url(req.url)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         hook.url = req.url
     if req.name is not None:
         hook.name = req.name
@@ -1386,6 +1408,10 @@ async def test_webhook(
     import httpx
 
     hook = await _resolve_webhook(webhook_id, user, db)
+    try:
+        await validate_webhook_url(hook.url)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     payload = {"event": "test", "webhook_id": hook.id, "timestamp": int(time.time())}
     body = json_mod.dumps(payload, separators=(",", ":"))
     sig = hmac.new(hook.secret.encode(), body.encode(), hashlib.sha256).hexdigest()
@@ -1400,7 +1426,7 @@ async def test_webhook(
     response_body = None
     succeeded = False
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
             resp = await client.post(hook.url, content=body, headers=headers)
             response_status = resp.status_code
             response_body = resp.text[:2000]
@@ -1456,10 +1482,15 @@ async def list_webhook_deliveries(
     }
 
 
-# Internal: called by API service to fetch endpoints for a given key
-@app.get("/webhooks/by-key/{key}", dependencies=[Depends(_require_internal)])
-async def webhooks_by_key(key: str, db: AsyncSession = Depends(get_db)):
-    key_row = (await db.execute(select(APIKey).where(APIKey.key == key, APIKey.is_active == True))).scalar_one_or_none()
+# Internal: called by API service to fetch endpoints for a given key. The key
+# stays in the Authorization header so it cannot leak into proxy access logs.
+@app.post("/webhooks/by-key", dependencies=[Depends(_require_internal)])
+async def webhooks_by_key(
+    credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer()),
+    db: AsyncSession = Depends(get_db),
+):
+    key = credentials.credentials
+    key_row = (await db.execute(select(APIKey).where(APIKey.key_hash == hash_api_key(key), APIKey.is_active == True))).scalar_one_or_none()
     if not key_row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "API key not found")
     result = await db.execute(

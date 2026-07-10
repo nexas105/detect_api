@@ -91,20 +91,27 @@ Response: {image_id, pose:{...}}
 
 ### POST /video/classify
 Classify video frame by frame. No size/duration limits for auth users.
-Params: model=nudenet|erax, fps=1.0 (0.1-30), max_frames=0 (0=unlimited)
+Params: model=nudenet|erax|ensemble, fps=1.0 (0.1-30), max_frames=0 (0=unlimited), async=true (optional)
 Response: {video_id, model, video_info, settings, frames:[{timestamp, detections}], summary:{total_detections, labels_found, max_score, nsfw_frames, nsfw_percentage}}
 
 ### POST /video/censor
 Censor video -- detect and blur NSFW regions.
-Params: model, fps=5.0, max_frames=0, labels (form), blur_radius=60 (5-200), interpolate=true
+Params: model, fps=5.0, max_frames=0, labels (form), blur_radius=60 (5-200), interpolate=true, async=true (optional)
 Response: video/mp4 binary
 Headers: X-Video-Id, X-Frames-Analyzed, X-Detections-Found
 
 ### POST /video/scenes
 Extract NSFW scenes as compiled highlight video.
-Params: model, fps=2.0 (0.5-10), min_scene_duration=2.0 (>=0.5), scene_padding=1.0 (>=0)
+Params: model, fps=2.0 (0.5-10), min_scene_duration=2.0 (>=0.5), scene_padding=1.0 (>=0), async=true (optional)
 Response: video/mp4 binary
 Headers: X-Video-Id, X-Scenes-Found, X-Total-Duration, X-Scenes-Duration, X-Scenes-Metadata (JSON)
+
+### Async jobs
+POST /batch and authenticated POST /video/* accept async=true and return HTTP 202:
+{job_id, status:"queued", status_url:"/jobs/{id}"}
+GET /jobs/{id} returns progress, JSON result/error, and output_url when available.
+GET /jobs/{id}/output downloads completed binary video output.
+Terminal events are sent as job.completed or job.failed to HMAC webhooks with trigger=any.
 
 ### GET /images
 List stored images. Params: category=censored|originals, limit=50 (max 200)

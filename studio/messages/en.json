@@ -120,7 +120,9 @@
     "apiKeys": "API Keys",
     "upload": "Upload",
     "rateMe": "Rate Me",
+    "faces": "Faces",
     "detections": "Detections",
+    "jobs": "Jobs",
     "webhooks": "Webhooks",
     "users": "Users",
     "tenants": "Tenants",
@@ -179,7 +181,16 @@
     "tenantInfo": "Tenant Info",
     "tenantName": "Tenant Name",
     "userCount": "Users",
-    "keyCount": "API Keys"
+    "keyCount": "API Keys",
+    "heroEyebrow": "Live · Last 24h",
+    "heroLabel": "Detection requests",
+    "perHour": "This hour",
+    "allTime": "All time",
+    "verdictLegend": "Decision classes",
+    "keyActivity": "Requests by key",
+    "allow": "Allow",
+    "flag": "Flag",
+    "block": "Block"
   },
   "apiKeys": {
     "title": "API Keys",

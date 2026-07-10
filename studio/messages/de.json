@@ -120,7 +120,9 @@
     "apiKeys": "API-Schluessel",
     "upload": "Upload",
     "rateMe": "Bewerten",
+    "faces": "Gesichter",
     "detections": "Erkennungen",
+    "jobs": "Jobs",
     "webhooks": "Webhooks",
     "users": "Benutzer",
     "tenants": "Mandanten",
@@ -179,7 +181,16 @@
     "tenantInfo": "Mandant-Info",
     "tenantName": "Mandant-Name",
     "userCount": "Benutzer",
-    "keyCount": "API-Schluessel"
+    "keyCount": "API-Schluessel",
+    "heroEyebrow": "Live · Letzte 24h",
+    "heroLabel": "Erkennungs-Anfragen",
+    "perHour": "Diese Stunde",
+    "allTime": "Gesamt",
+    "verdictLegend": "Entscheidungsklassen",
+    "keyActivity": "Anfragen pro Schluessel",
+    "allow": "Zulassen",
+    "flag": "Markieren",
+    "block": "Blockieren"
   },
   "apiKeys": {
     "title": "API-Schluessel",

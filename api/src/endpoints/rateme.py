@@ -12,6 +12,7 @@ If CLIP unavailable: its 40% weight shifts to eroticism (70% total).
 
 from __future__ import annotations
 
+import asyncio
 import math
 
 from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
@@ -19,9 +20,12 @@ from fastapi.responses import JSONResponse
 from PIL import Image, ImageFilter, ImageStat
 
 from ..auth import KeyInfo, log_usage_bg, save_detection_bg, validate_api_key
-from ..cache import get_cached, hash_image, set_cached
+from ..cache import (
+    get_cached, get_shared_detection, hash_image, set_cached, set_shared_detection,
+)
 from ..clip_scorer import full_analysis_async
 from ..demo import demo_limiter
+from .demo import _get_demo_key
 from ..webhooks import dispatch_event_bg
 from ..models import (
     ModelName, get_ext, model_version_for, preprocess, preprocess_full,
@@ -30,6 +34,83 @@ from ..models import (
 from ..schemas import DemoRateMeResponse, RateMeResponse
 
 router = APIRouter()
+
+
+# ── Endpoint-agnostic inference cache (P1-A) ─────────────────────────────────
+# The expensive pieces — per-model detection and CLIP full_analysis — are cached
+# on image+model version ONLY, so classify/rateme/moderate reuse each other's work
+# (a rateme call warms nudenet+erax+clip; a later classify(nudenet) then hits two
+# of them). Endpoint-specific work (merge/rating/action) stays endpoint-local.
+
+
+async def cached_detection(image_hash, model, detect_img, scale, no_cache=False) -> list[dict]:
+    ver = f"{model.value}+{model_version_for(model)}"
+    if not no_cache:
+        hit = await get_shared_detection(image_hash, ver)
+        if hit is not None:
+            return hit["detections"]
+    dets = await run_detection_async(detect_img, model, scale)
+    if not no_cache:
+        await set_shared_detection(image_hash, ver, {"detections": dets})
+    return dets
+
+
+async def cached_clip(image_hash, full_img, no_cache=False) -> dict:
+    ver = f"clip+{model_version_for('clip')}"
+    if not no_cache:
+        hit = await get_shared_detection(image_hash, ver)
+        if hit is not None:
+            return hit
+    analysis = await full_analysis_async(full_img)
+    if not no_cache:
+        await set_shared_detection(image_hash, ver, analysis)
+    return analysis
+
+
+# ── Shared analysis + persist boilerplate (rateme/moderate/classify) ─────────
+
+
+async def analyze_core(
+    image_hash: str, detect_img, full_img, scale: float, no_cache: bool = False,
+) -> dict:
+    """The nudenet+erax+clip pass shared by rateme and moderate.
+
+    Runs the three models concurrently (each shared-cached), merges detections,
+    and computes the rating. Returns {detections, clip_analysis, rating}.
+    """
+    nudenet_dets, erax_dets, clip_analysis = await asyncio.gather(
+        cached_detection(image_hash, ModelName.nudenet, detect_img, scale, no_cache),
+        cached_detection(image_hash, ModelName.erax, detect_img, scale, no_cache),
+        cached_clip(image_hash, full_img, no_cache),
+    )
+    detections = _merge_detections(nudenet_dets, erax_dets)
+    rating = await compute_rating(detections, full_img, clip_analysis)
+    return {"detections": detections, "clip_analysis": clip_analysis, "rating": rating}
+
+
+async def persist_result(
+    data: bytes, filename, key_info, name: str, model_str: str, detections: list[dict],
+) -> str:
+    """Store the original, log usage, and persist the detection record.
+
+    ``name`` is both the endpoint path (``/{name}``) and the detection kind.
+    Returns the freshly minted image_id.
+    """
+    image_id, orig_path = await store_image_async(data, get_ext(filename), "originals")
+    log_usage_bg(key_info, f"/{name}", "POST", 200)
+    save_detection_bg(key_info, image_id, name, model_str, detections, original_path=orig_path)
+    return image_id
+
+
+async def cache_hit_response(
+    data: bytes, filename, key_info, name: str, model_str: str, cached: dict,
+) -> JSONResponse:
+    """Build the X-Cache: HIT response: copy cached body, mint a fresh image_id."""
+    cached = dict(cached)
+    cached["image_id"] = await persist_result(
+        data, filename, key_info, name, model_str, cached.get("detections", []),
+    )
+    return JSONResponse(content=cached, headers={"X-Cache": "HIT"})
 
 
 # ── Label Bundles ───────────────────────────────────────────────────────────
@@ -387,12 +468,16 @@ def _score_age_attractiveness(age_data: dict) -> dict:
     return {"score": round(min(1.0, max(0.0, score)), 4), "estimated_age": age, "available": True}
 
 
-async def compute_rating(detections: list[dict], img: Image.Image) -> dict:
+async def compute_rating(
+    detections: list[dict],
+    img: Image.Image,
+    clip_analysis: dict | None = None,
+) -> dict:
     """Compute multi-factor rating with full CLIP analysis (sexiness, age, deepfake, clothing)."""
     w, h = img.size
 
     eroticism = _score_eroticism(detections)
-    clip_all = await full_analysis_async(img)  # single CLIP pass for all
+    clip_all = clip_analysis if clip_analysis is not None else await full_analysis_async(img)
     quality = _score_image_quality(img)
     composition = _score_composition(detections, w, h)
     aesthetics = _score_aesthetics(img)
@@ -502,21 +587,15 @@ async def rate_me(
     if not no_cache:
         cached = await get_cached(image_hash, cache_version, cache_endpoint)
         if cached is not None:
-            log_usage_bg(key_info, "/rateme", "POST", 200)
-            return JSONResponse(content=cached, headers={"X-Cache": "HIT"})
+            return await cache_hit_response(data, file.filename, key_info, "rateme", "nudenet+erax", cached)
 
     detect_img, scale, full_img = preprocess_full(data)
 
-    # Run BOTH models and merge
-    nudenet_dets = await run_detection_async(detect_img, ModelName.nudenet, scale)
-    erax_dets = await run_detection_async(detect_img, ModelName.erax, scale)
-    detections = _merge_detections(nudenet_dets, erax_dets)
+    core = await analyze_core(image_hash, detect_img, full_img, scale, no_cache)
+    detections = core["detections"]
+    rating = core["rating"]
 
-    rating = await compute_rating(detections, full_img)
-
-    image_id, orig_path = await store_image_async(data, get_ext(file.filename), "originals")
-    log_usage_bg(key_info, "/rateme", "POST", 200)
-    save_detection_bg(key_info, image_id, "rateme", "nudenet+erax", detections, original_path=orig_path)
+    image_id = await persist_result(data, file.filename, key_info, "rateme", "nudenet+erax", detections)
 
     result = {
         "image_id": image_id,
@@ -526,7 +605,10 @@ async def rate_me(
     }
 
     if not no_cache:
-        await set_cached(image_hash, cache_version, cache_endpoint, result)
+        await set_cached(
+            image_hash, cache_version, cache_endpoint,
+            {k: v for k, v in result.items() if k != "image_id"},
+        )
 
     # Fire webhooks — fire-and-forget, never blocks the response
     dispatch_event_bg(key_info.raw_key, "rateme", {**result, "image_hash": image_hash})
@@ -545,35 +627,22 @@ async def demo_rate_me(
     (10 images/hour) and a 10MB file size cap. Results are stored under
     the demo system account.
     """
-    from ..auth import get_http_client, KeyInfo, log_usage_bg, save_detection_bg
-    from ..config import AUTH_SERVICE_URL
-
-    demo_limiter.check_image(request)
+    await demo_limiter.check_image(request)
     data = await file.read()
     validate_upload(data, max_size=10 * 1024 * 1024)
 
+    image_hash = hash_image(data)
     detect_img, scale, full_img = preprocess_full(data)
-    nudenet_dets = await run_detection_async(detect_img, ModelName.nudenet, scale)
-    erax_dets = await run_detection_async(detect_img, ModelName.erax, scale)
-    detections = _merge_detections(nudenet_dets, erax_dets)
+    core = await analyze_core(image_hash, detect_img, full_img, scale)
+    detections = core["detections"]
+    rating = core["rating"]
 
-    rating = await compute_rating(detections, full_img)
-
-    # Store under demo account
+    # Store under demo account — best-effort, never fails the response.
     try:
-        client = await get_http_client()
-        resp = await client.get(f"{AUTH_SERVICE_URL}/demo/key")
-        if resp.status_code == 200:
-            raw_key = resp.json()["key"]
-            resp2 = await client.post(
-                f"{AUTH_SERVICE_URL}/validate-key",
-                headers={"Authorization": f"Bearer {raw_key}"},
-            )
-            if resp2.status_code == 200:
-                key_info = KeyInfo(resp2.json(), raw_key)
-                image_id, orig_path = await store_image_async(data, get_ext(file.filename), "originals")
-                log_usage_bg(key_info, "/demo/rateme", "POST", 200)
-                save_detection_bg(key_info, image_id, "demo-rateme", "nudenet+erax", detections, original_path=orig_path)
+        key_info = await _get_demo_key()
+        image_id, orig_path = await store_image_async(data, get_ext(file.filename), "originals")
+        log_usage_bg(key_info, "/demo/rateme", "POST", 200)
+        save_detection_bg(key_info, image_id, "demo-rateme", "nudenet+erax", detections, original_path=orig_path)
     except Exception:
         pass  # non-critical
 
@@ -582,5 +651,5 @@ async def demo_rate_me(
         "rating": rating,
         "detections": detections,
         "demo": True,
-        "limits": demo_limiter.get_remaining(request),
+        "limits": await demo_limiter.get_remaining(request),
     }

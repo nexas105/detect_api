@@ -41,6 +41,14 @@ make get-models   # ML-Modelle vorab herunterladen (optional, passiert auch auto
 make dev-local    # alle Services starten (SQLite)
 ```
 
+Standardmaessig wird das genauere EraX-YOLO11m-Modell geladen. Fuer Systeme
+mit weniger RAM/CPU kann in der Environment `ERAX_MODEL_SIZE=s` oder `n`
+gesetzt werden. NudeNet nutzt weiterhin das genauere offizielle 640m-Modell.
+Mit `model=ensemble` laufen NudeNet und EraX auf demselben Input. Ueberlappende
+Treffer werden ueber ein gemeinsames `concept` fusioniert; `sources` zeigt,
+welche Modelle den Treffer stuetzen. Studio und Demo verwenden fuer „Both“
+automatisch diesen einzelnen Request.
+
 Einzelne Services:
 
 ```bash
@@ -169,7 +177,7 @@ Swagger UI: http://localhost:8000/docs
 |----------|:-------:|-------------|
 | `/classify` | POST | Detection + Age + Deepfake + Clothing (CLIP) |
 | `/censor` | POST | NSFW-Regionen mit Gaussian Blur zensieren, PNG zurueck |
-| `/batch` | POST | ZIP/RAR-Archiv -- extrahiert und klassifiziert alle Bilder |
+| `/batch` | POST | ZIP/RAR-Archiv; mit `async=true` als Background-Job |
 | `/rateme` | POST | Multi-Faktor Sexiness-Scoring (6 Faktoren) |
 | `/moderate` | POST | All-in-One Moderation: allow/flag/block + Confidence + Reasons |
 | `/embed` | POST | CLIP-Embedding (768-dim Vektor) fuer Downstream-Anwendungen |
@@ -186,9 +194,11 @@ Swagger UI: http://localhost:8000/docs
 
 | Endpoint | Methode | Beschreibung |
 |----------|:-------:|-------------|
-| `/video/classify` | POST | Frame-by-Frame-Analyse, konfigurierbares FPS/max_frames |
-| `/video/censor` | POST | Video-Blur, H.264-Output, Interpolation zwischen Frames |
-| `/video/scenes` | POST | Erotische Szenen extrahieren + als Highlight-Video zusammenschneiden |
+| `/video/classify` | POST | Frame-Analyse; mit `async=true` als Background-Job |
+| `/video/censor` | POST | Video-Blur/H.264; mit `async=true` als Background-Job |
+| `/video/scenes` | POST | Highlight-Video; mit `async=true` als Background-Job |
+| `/jobs/{id}` | GET | Tenant-isolierter Job-Status und JSON-Ergebnis |
+| `/jobs/{id}/output` | GET | Binaeren Output eines fertigen Video-Jobs laden |
 
 #### Demo (kein Auth, IP-basiertes Rate-Limiting)
 
@@ -230,6 +240,11 @@ curl -X POST "http://localhost:8000/classify?model=erax" \
   -H "Authorization: Bearer $API_KEY" \
   -F "file=@photo.jpg"
 
+# Ensemble: beide Detektoren mit einem Upload
+curl -X POST "http://localhost:8000/classify?model=ensemble" \
+  -H "Authorization: Bearer $API_KEY" \
+  -F "file=@photo.jpg"
+
 # Censor
 curl -X POST http://localhost:8000/censor \
   -H "Authorization: Bearer $API_KEY" \
@@ -247,6 +262,15 @@ curl -X POST http://localhost:8000/censor \
 curl -X POST http://localhost:8000/batch \
   -H "Authorization: Bearer $API_KEY" \
   -F "file=@images.zip"
+
+# Batch asynchron starten (HTTP 202)
+curl -X POST "http://localhost:8000/batch?async=true&model=ensemble" \
+  -H "Authorization: Bearer $API_KEY" \
+  -F "file=@images.zip"
+
+# Status/Ergebnis abfragen
+curl http://localhost:8000/jobs/<job_id> \
+  -H "Authorization: Bearer $API_KEY"
 
 # Rate-Me
 curl -X POST http://localhost:8000/rateme \
@@ -446,14 +470,15 @@ Block-Regeln: Minor erkannt, extreme Kategorie, oder sexual_act Label >0.7 Confi
 
 ## Worker Pool
 
-Konfigurierbare ML-Parallelitaet ueber `ML_WORKERS`:
+Die HTTP-Inferenz laeuft thread-basiert im API-Prozess. `ML_WORKERS=0` ist
+deshalb der empfohlene und in Docker verwendete Default. Der experimentelle
+Prozess-Pool ist fuer kuenftige Queue-Jobs vorgesehen und sollte fuer den
+aktuellen HTTP-Pfad nicht aktiviert werden.
 
 | ML_WORKERS | Modus | RAM-Verbrauch |
 |:----------:|-------|:-------------:|
 | 0 | Inline (gleicher Prozess) | ~2 GB |
-| 1 | 1 separater Prozess | ~2 GB |
-| 2 | 2 separate Prozesse | ~2.8 GB |
-| 4 | 4 separate Prozesse | ~3.5 GB |
+| 1+ | Experimenteller separater Pool (HTTP derzeit nicht angebunden) | zusaetzlich |
 
 ### CPU vs. GPU
 
@@ -461,45 +486,49 @@ Das Default-Setup nutzt **CPU-only PyTorch** (~200 MB). Das spart ~2.5 GB Docker
 
 **Fuer GPU-Beschleunigung (NVIDIA CUDA):**
 
-1. In `api/requirements.txt` die CPU-Pinning-Zeilen entfernen:
+Es gibt ein fertiges Override `docker-compose.gpu.yml`. Kein manuelles Editieren
+von `requirements.txt`, `Dockerfile` oder `docker-compose.yml` mehr noetig.
 
-```diff
-- --extra-index-url https://download.pytorch.org/whl/cpu
-- torch==2.11.0+cpu
-- torchvision==0.26.0+cpu
-```
-
-2. PyTorch installiert dann automatisch die CUDA-Version (~530 MB + ~2.5 GB NVIDIA-Libraries).
-
-3. In `api/Dockerfile` die NVIDIA Runtime aktivieren:
-
-```dockerfile
-# Nach FROM python:3.12-slim hinzufuegen:
-ENV NVIDIA_VISIBLE_DEVICES=all
-ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
-```
-
-4. In `docker-compose.yml` dem API-Service GPU-Zugriff geben:
-
-```yaml
-api:
-  ...
-  deploy:
-    resources:
-      reservations:
-        devices:
-          - driver: nvidia
-            count: 1
-            capabilities: [gpu]
-```
-
-5. Docker muss mit NVIDIA Container Toolkit laufen:
+1. Host vorbereiten (NVIDIA-Treiber + Container-Toolkit):
 
 ```bash
 # Ubuntu/Debian
 apt install nvidia-container-toolkit
 systemctl restart docker
 ```
+
+2. Mit dem GPU-Override starten (baut das CUDA-Image, `--build` noetig):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+
+# mit Redis:
+docker compose -f docker-compose.yml -f docker-compose.redis.yml -f docker-compose.gpu.yml up --build
+```
+
+Das Override setzt fuer den `api`-Service den Build-Arg `TORCH_VARIANT=cuda`
+(ersetzt CPU-`torch`/`torchvision` durch den CUDA-Build und tauscht
+`onnxruntime` gegen `onnxruntime-gpu`), die GPU-Reservierung
+(`deploy.resources.reservations.devices`), die `NVIDIA_*`-Env sowie den
+`LD_LIBRARY_PATH`, ueber den `onnxruntime-gpu` die vom CUDA-`torch`-Wheel
+gebuendelten CUDA/cuDNN-Libs findet.
+
+**Beschleunigt werden alle drei Modelle:** EraX (YOLO) und CLIP ueber CUDA-`torch`,
+NudeNet ueber `onnxruntime-gpu` (nutzt dieselben CUDA/cuDNN-Libs).
+
+Optional einen zum Treiber passenden CUDA-Wheel-Channel pinnen:
+
+```bash
+TORCH_CUDA_INDEX=https://download.pytorch.org/whl/cu124 \
+  docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+```
+
+> **Hinweis:** Der GPU-Pfad laesst sich nur auf einem echten NVIDIA-Host bauen und
+> testen. `onnxruntime-gpu` und das CUDA-`torch`-Wheel muessen denselben CUDA-/cuDNN-Major
+> nutzen (aktuell CUDA 12 / cuDNN 9). Findet `onnxruntime-gpu` die cuDNN-Libs nicht,
+> faellt NudeNet still auf CPU zurueck — dann den `LD_LIBRARY_PATH` im Override gegen
+> den tatsaechlichen site-packages-Pfad im Image pruefen. Der Standard-Build bleibt
+> **CPU-only**; `requirements.txt` ist unveraendert.
 
 **Performance-Vergleich (ungefaehr):**
 
@@ -552,6 +581,24 @@ Event-basierte Benachrichtigungen fuer API-Ergebnisse:
 - Retry mit exponentiellem Backoff (sofort, 1min, 5min, 30min)
 - Konfigurierbar pro API-Key ueber Studio oder Auth-API
 - Zustellungshistorie einsehbar
+- Async-Jobs senden `job.completed` oder `job.failed` an Webhooks mit Trigger `any`
+
+### Async-Job-Antwort
+
+`/batch` und alle authentifizierten `/video/*`-Verarbeitungsendpoints akzeptieren
+`async=true` und antworten nach dem sicheren Speichern des Uploads mit HTTP 202:
+
+```json
+{
+  "job_id": "d6ad4be8-...",
+  "status": "queued",
+  "status_url": "/jobs/d6ad4be8-..."
+}
+```
+
+Der Status durchlaeuft `queued`, `running` und `succeeded` oder `failed`.
+Video-Jobs stellen nach Erfolg zusaetzlich `output_url` bereit. Job-Status und
+Output sind auf den Tenant des verwendeten API-Keys beschraenkt.
 
 ---
 
@@ -608,7 +655,7 @@ Next.js 16 + Mantine 9 Admin-Dashboard mit i18n (EN/DE).
 - **Migrationen**: Alembic in `db/migrations/`
 - **Error-Handling**: Strukturierte JSON-Fehlerantworten mit Request-ID-Tracking
 - **CORS**: Immer aktiv, faellt auf `["*"]` zurueck wenn keine Origins konfiguriert
-- **1 Worker**: Uvicorn laeuft mit einem Worker (ML-Modelle nicht multiprocess-safe; `ML_WORKERS` fuer Parallelitaet)
+- **1 Uvicorn-Worker**: Modell-Singletons bleiben in einem Prozess; unabhängige Modelle laufen intern parallel
 - **Demo-Account**: Demo-Tenant + System-User werden beim Start automatisch geseeded
 
 ---
@@ -621,6 +668,8 @@ Next.js 16 + Mantine 9 Admin-Dashboard mit i18n (EN/DE).
 |----------|-------------|---------|
 | `STORAGE_DIR` | Bildspeicherung | `/app/storage` |
 | `MODEL_DIR` | ML-Model-Pfad | `/app/models` |
+| `ERAX_MODEL_SIZE` | EraX-Groesse: `n`, `s` oder `m` (genauester Default) | `m` |
+| `ERAX_MODEL_REVISION` | Gepinnter Hugging-Face-Commit fuer reproduzierbare Downloads | `90878ab...` |
 | `API_PORT` | Detection API Port | `8000` |
 | `API_HOST` | Bind-Adresse | `0.0.0.0` |
 | `AUTH_SERVICE_URL` | API -> Auth Kommunikation | `http://localhost:8001` |
@@ -703,6 +752,7 @@ make dev-docker     # neu starten
 |-------|-------------|
 | `docker-compose.yml` | Standard-Services (API, Auth, DB, Studio) |
 | `docker-compose.redis.yml` | Optionaler Redis-Override |
+| `docker-compose.gpu.yml` | NVIDIA-CUDA-GPU-Override (torch + onnxruntime-gpu) |
 | `docker-compose.coolify.yml` | Coolify/Traefik Routing-Config |
 | `api/Dockerfile` | API-Image inkl. ffmpeg + ML-Modelle |
 | `auth/Dockerfile` | Auth-Image (Python slim) |

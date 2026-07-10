@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from functools import partial
 
 import torch
@@ -18,6 +19,7 @@ logger = logging.getLogger("api.clip")
 _clip_model = None
 _clip_processor = None
 _clip_loaded = False
+_clip_lock = threading.Lock()
 
 
 # ── Prompt Definitions ──────────────────────────────────────────────────────
@@ -61,6 +63,13 @@ CLOTHING_PROMPTS = [
     ("a fully nude person with no clothing", "nude"),
 ]
 
+# Exposure level per clothing label (0=fully clothed, 1=nude).
+EXPOSURE_WEIGHTS = {
+    "formal": 0.0, "casual": 0.05, "dress": 0.1,
+    "sportswear": 0.15, "swimwear": 0.5, "lingerie": 0.65,
+    "minimal": 0.85, "nude": 1.0,
+}
+
 
 # ── Model Loading ───────────────────────────────────────────────────────────
 
@@ -69,23 +78,26 @@ def _load_clip():
     global _clip_model, _clip_processor, _clip_loaded
     if _clip_loaded:
         return _clip_model, _clip_processor
-    _clip_loaded = True
+    with _clip_lock:
+        if _clip_loaded:
+            return _clip_model, _clip_processor
+        try:
+            from transformers import CLIPModel, CLIPProcessor
 
-    try:
-        from transformers import CLIPModel, CLIPProcessor
-
-        model_name = "openai/clip-vit-base-patch32"
-        logger.info("Loading CLIP model: %s", model_name)
-        _clip_processor = CLIPProcessor.from_pretrained(model_name)
-        _clip_model = CLIPModel.from_pretrained(model_name)
-        _clip_model.eval()
-        if torch.cuda.is_available():
-            _clip_model = _clip_model.cuda()
-        logger.info("CLIP loaded successfully")
-    except Exception as e:
-        logger.warning("CLIP not available: %s", e)
-        _clip_model = None
-        _clip_processor = None
+            model_name = "openai/clip-vit-base-patch32"
+            logger.info("Loading CLIP model: %s", model_name)
+            _clip_processor = CLIPProcessor.from_pretrained(model_name)
+            _clip_model = CLIPModel.from_pretrained(model_name)
+            _clip_model.eval()
+            if torch.cuda.is_available():
+                _clip_model = _clip_model.cuda()
+            logger.info("CLIP loaded successfully")
+        except Exception as e:
+            logger.warning("CLIP not available: %s", e)
+            _clip_model = None
+            _clip_processor = None
+        finally:
+            _clip_loaded = True
 
     return _clip_model, _clip_processor
 
@@ -205,13 +217,7 @@ def detect_clothing(img: Image.Image) -> dict:
     scores = {labels[i]: round(probs[i], 4) for i in range(len(labels))}
     top_idx = max(range(len(probs)), key=lambda i: probs[i])
 
-    # Exposure level (0=fully clothed, 1=nude)
-    exposure_weights = {
-        "formal": 0.0, "casual": 0.05, "dress": 0.1,
-        "sportswear": 0.15, "swimwear": 0.5, "lingerie": 0.65,
-        "minimal": 0.85, "nude": 1.0,
-    }
-    exposure = sum(probs[i] * exposure_weights.get(labels[i], 0) for i in range(len(labels)))
+    exposure = sum(probs[i] * EXPOSURE_WEIGHTS.get(labels[i], 0) for i in range(len(labels)))
 
     return {
         "clothing": labels[top_idx],
@@ -282,9 +288,7 @@ def full_analysis(img: Image.Image) -> dict:
     cl_probs = torch.softmax(all_logits[idx:idx + n], dim=0).numpy()
     cl_labels = [p[1] for p in CLOTHING_PROMPTS]
     cl_top = cl_labels[max(range(n), key=lambda i: cl_probs[i])]
-    exposure_weights = {"formal": 0.0, "casual": 0.05, "dress": 0.1, "sportswear": 0.15,
-                        "swimwear": 0.5, "lingerie": 0.65, "minimal": 0.85, "nude": 1.0}
-    exposure = sum(float(cl_probs[i]) * exposure_weights.get(cl_labels[i], 0) for i in range(n))
+    exposure = sum(float(cl_probs[i]) * EXPOSURE_WEIGHTS.get(cl_labels[i], 0) for i in range(n))
 
     # Age bracket
     bracket = "minor" if est_age < 18 else "young_adult" if est_age < 25 else "adult" if est_age < 35 else "middle_aged" if est_age < 50 else "senior"

@@ -8,13 +8,12 @@ import {
   Text,
 } from '@mantine/core';
 import { IconBrain } from '@tabler/icons-react';
-import { useEffect, useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { DashboardShell } from '@/components/DashboardShell/DashboardShell';
 import { PageHeader } from '@/components/PageHeader/PageHeader';
 import { EmptyState } from '@/components/EmptyState/EmptyState';
 import { SkeletonList } from '@/components/SkeletonList/SkeletonList';
-import { API_URL, useAuth } from '@/lib/auth';
+import { useAuthQuery } from '@/lib/use-auth-query';
 
 interface Model {
   name: string;
@@ -23,31 +22,13 @@ interface Model {
 }
 
 export default function ModelsPage() {
-  const { authFetch } = useAuth();
   const t = useTranslations('models');
   const tCommon = useTranslations('common');
-  const [models, setModels] = useState<Model[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const res = await authFetch(`${API_URL}/models`);
-        if (res.ok) {
-          const data = await res.json();
-          setModels(Array.isArray(data) ? data : data.models ?? []);
-        } else {
-          setError(tCommon('error'));
-        }
-      } catch {
-        setError(tCommon('error'));
-      } finally {
-        setLoading(false);
-      }
-    };
-    load();
-  }, [authFetch, tCommon]);
+  const { data, error, isLoading: loading } = useAuthQuery<Model[] | { models: Model[] }>(
+    '/models',
+    { base: 'api' }
+  );
+  const models = Array.isArray(data) ? data : data?.models ?? [];
 
   return (
     <DashboardShell>
@@ -77,7 +58,7 @@ export default function ModelsPage() {
               {model.labels && model.labels.length > 0 && (
                 <Group gap="xs">
                   {model.labels.map((label) => (
-                    <Badge key={label} variant="light" size="sm">
+                    <Badge key={label} className="data-mono" variant="light" size="sm">
                       {label}
                     </Badge>
                   ))}

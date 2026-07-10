@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
@@ -11,20 +12,20 @@ from PIL import Image
 from ..auth import KeyInfo, log_usage_bg, save_detection_bg, validate_api_key
 from ..cache import get_cached, hash_image, set_cached
 from ..webhooks import dispatch_event_bg
-from ..clip_scorer import full_analysis_async
 from ..models import (
     DEFAULT_CENSOR, ModelName, apply_censoring, get_ext, model_version_for,
-    preprocess_full, run_detection_async, store_image_async, store_image_with_id_async, validate_upload,
+    preprocess_full, store_image_async, store_image_with_id_async, validate_upload,
 )
+from .rateme import cache_hit_response, cached_clip, cached_detection, persist_result
 from ..schemas import ClassifyResponse
 
 router = APIRouter()
 
 
-async def _run_clip_analysis(img: Image.Image) -> dict:
-    """Run CLIP analysis on a pre-decoded PIL Image. Returns empty dict on failure."""
+async def _run_clip_analysis(image_hash: str, img: Image.Image, no_cache: bool = False) -> dict:
+    """Run shared-cached CLIP analysis on a pre-decoded PIL Image. Returns {} on failure."""
     try:
-        return await full_analysis_async(img)
+        return await cached_clip(image_hash, img, no_cache)
     except Exception:
         return {}
 
@@ -58,19 +59,19 @@ async def classify(
     if not no_cache:
         cached = await get_cached(image_hash, cache_version, cache_key_endpoint)
         if cached is not None:
-            # Still log usage — customer pays even on a cache hit
-            log_usage_bg(key_info, "/classify", "POST", 200)
-            return JSONResponse(content=cached, headers={"X-Cache": "HIT"})
+            # Cache contains reusable inference only. Every request gets its own
+            # storage record so IDs never leak across users/tenants.
+            return await cache_hit_response(data, file.filename, key_info, "classify", model.value, cached)
 
     detect_img, scale, full_img = preprocess_full(data)
-    detections = await run_detection_async(detect_img, model, scale)
+    # Detection and CLIP use independent models, run concurrently; both are
+    # shared-cached across endpoints (a prior rateme/moderate warms them).
+    detections, analysis = await asyncio.gather(
+        cached_detection(image_hash, model, detect_img, scale, bool(no_cache)),
+        _run_clip_analysis(image_hash, full_img, bool(no_cache)),
+    )
 
-    # CLIP analysis (age, deepfake, clothing) — reuses already-decoded full_img
-    analysis = await _run_clip_analysis(full_img)
-
-    image_id, orig_path = await store_image_async(data, get_ext(file.filename), "originals")
-    log_usage_bg(key_info, "/classify", "POST", 200)
-    save_detection_bg(key_info, image_id, "classify", model.value, detections, original_path=orig_path)
+    image_id = await persist_result(data, file.filename, key_info, "classify", model.value, detections)
 
     result = {"image_id": image_id, "model": model.value, "detections": detections}
     if analysis:
@@ -78,13 +79,12 @@ async def classify(
         result["deepfake"] = analysis.get("deepfake")
         result["clothing"] = analysis.get("clothing")
 
-    # Store in cache (image_id will differ on each upload — that's fine, it's just a
-    # pointer to stored bytes; the detection content is what matters for callers)
+    # Store reusable inference only; image_id is generated per request, including hits.
     if not no_cache:
-        # Build a cacheable variant without the per-request image_id so different
-        # uploads of the same bytes don't get an outdated id. Callers that need the
-        # fresh id should pass ?no_cache=1.
-        await set_cached(image_hash, cache_version, cache_key_endpoint, result)
+        await set_cached(
+            image_hash, cache_version, cache_key_endpoint,
+            {k: v for k, v in result.items() if k != "image_id"},
+        )
 
     # Fire webhooks — fire-and-forget, never blocks the response
     dispatch_event_bg(key_info.raw_key, "classify", {**result, "image_hash": image_hash})
@@ -115,8 +115,9 @@ async def censor(
     """
     data = await file.read()
     validate_upload(data)
+    image_hash = hash_image(data)
     detect_img, scale, full_img = preprocess_full(data)
-    detections = await run_detection_async(detect_img, model, scale)
+    detections = await cached_detection(image_hash, model, detect_img, scale)
 
     censor_labels = (
         [l.strip() for l in labels.split(",") if l.strip()]
@@ -125,8 +126,8 @@ async def censor(
 
     censored_bytes = apply_censoring(full_img, detections, censor_labels)
 
-    # CLIP analysis — reuses already-decoded full_img
-    analysis = await _run_clip_analysis(full_img)
+    # CLIP analysis — shared-cached, reuses already-decoded full_img
+    analysis = await _run_clip_analysis(image_hash, full_img)
 
     image_id, orig_path = await store_image_async(data, get_ext(file.filename), "originals")
     censored_path = await store_image_with_id_async(censored_bytes, ".png", "censored", image_id)

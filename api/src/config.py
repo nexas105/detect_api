@@ -25,6 +25,20 @@ S3_PRESIGN_EXPIRES = int(os.getenv("S3_PRESIGN_EXPIRES", "3600"))
 
 MODEL_DIR = Path(os.getenv("MODEL_DIR", os.path.expanduser("~/.nudenet_api/models")))
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+# EraX publishes YOLO11 nano/small/medium weights. Medium has the best reported
+# accuracy; smaller variants remain useful for memory-constrained deployments.
+ERAX_MODEL_SIZE = os.getenv("ERAX_MODEL_SIZE", "m").strip().lower()
+if ERAX_MODEL_SIZE not in {"n", "s", "m"}:
+    raise ValueError("ERAX_MODEL_SIZE must be one of: n, s, m")
+ERAX_MODEL_REVISION = os.getenv(
+    "ERAX_MODEL_REVISION", "90878ab981060833413ae1a24df72f5e1fff66bc"
+).strip()
+ERAX_MODEL_FILENAME = f"erax-anti-nsfw-yolo11{ERAX_MODEL_SIZE}-v1.1.pt"
+# Comma-separated CIDRs/IPs of proxy hops allowed to set X-Forwarded-For.
+# Empty → XFF is not trusted at all (client.host used); set to your reverse
+# proxy's address(es) in production so the real client IP can be resolved.
+TRUSTED_PROXIES = os.getenv("TRUSTED_PROXIES", "").strip()
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", "").strip() or None
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", str(50 * 1024 * 1024)))

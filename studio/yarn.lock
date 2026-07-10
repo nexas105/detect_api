@@ -3071,7 +3071,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@mantine/notifications@npm:^9.1.0":
+"@mantine/notifications@npm:9.1.0":
   version: 9.1.0
   resolution: "@mantine/notifications@npm:9.1.0"
   dependencies:
@@ -9000,7 +9000,7 @@ __metadata:
     "@babel/core": "npm:^7.28.4"
     "@mantine/core": "npm:9.1.0"
     "@mantine/hooks": "npm:9.1.0"
-    "@mantine/notifications": "npm:^9.1.0"
+    "@mantine/notifications": "npm:9.1.0"
     "@next/bundle-analyzer": "npm:^16.0.0"
     "@storybook/addon-themes": "npm:^10.0.0"
     "@storybook/nextjs": "npm:^10.0.0"

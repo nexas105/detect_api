@@ -22,6 +22,17 @@ async def get_db():
         yield session
 
 
+def _auto_create_enabled() -> bool:
+    """create_all is a dev convenience only. In prod (PostgreSQL) schema is
+    owned by Alembic, so it defaults off. DB_AUTO_CREATE overrides either way."""
+    flag = os.getenv("DB_AUTO_CREATE")
+    if flag is not None:
+        return flag.strip().lower() in ("1", "true", "yes", "on")
+    return DATABASE_URL.startswith("sqlite")
+
+
 async def init_db():
+    if not _auto_create_enabled():
+        return
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

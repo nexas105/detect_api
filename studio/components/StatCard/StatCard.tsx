@@ -16,33 +16,34 @@ export function StatCard({
   label,
   value,
   icon: Icon,
-  color = 'violet',
+  color = 'cyan',
   delta,
   deltaPositive,
 }: StatCardProps) {
   return (
-    <Paper withBorder p="md" radius="md">
-      <Group justify="space-between" wrap="nowrap">
+    <Paper withBorder p="md" style={{ background: 'var(--surface)' }}>
+      <Group justify="space-between" wrap="nowrap" align="flex-start">
         <div style={{ minWidth: 0 }}>
-          <Text c="dimmed" tt="uppercase" fw={700} fz="xs" truncate>
+          <Text c="dimmed" tt="uppercase" fw={600} fz={11} lts={0.6} truncate>
             {label}
           </Text>
-          <Text fw={700} fz="xl" mt={4} truncate>
+          <Text className="data-mono" fw={600} fz={26} mt={6} lh={1.1} truncate>
             {value}
           </Text>
           {delta != null ? (
             <Text
+              className="data-mono"
               fz="xs"
-              mt={2}
-              c={deltaPositive === undefined ? 'dimmed' : deltaPositive ? 'teal' : 'red'}
+              mt={4}
+              c={deltaPositive === undefined ? 'dimmed' : deltaPositive ? 'allow.6' : 'block.6'}
             >
               {delta}
             </Text>
           ) : null}
         </div>
         {Icon ? (
-          <ThemeIcon color={color} variant="light" size={48} radius="md">
-            <Icon size={26} stroke={1.5} />
+          <ThemeIcon color={color} variant="light" size={40} radius="sm">
+            <Icon size={22} stroke={1.6} />
           </ThemeIcon>
         ) : null}
       </Group>

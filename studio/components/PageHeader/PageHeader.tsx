@@ -17,9 +17,11 @@ export function PageHeader({ title, subtitle, actions }: PageHeaderProps) {
       wrap="wrap"
       gap="md"
       mb="lg"
+      pb="md"
+      style={{ borderBottom: '1px solid var(--hairline)' }}
     >
       <Stack gap={4} style={{ minWidth: 0, flex: 1 }}>
-        <Title order={2} fz={{ base: 22, sm: 26 }} lh={1.2}>
+        <Title order={2} fz={{ base: 22, sm: 26 }} lh={1.2} style={{ letterSpacing: -0.4 }}>
           {title}
         </Title>
         {subtitle ? (

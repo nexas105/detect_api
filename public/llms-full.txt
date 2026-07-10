@@ -57,13 +57,13 @@ Demo users: IP-based, 10 images/hour, 1 archive/hour.
 3-tier implementation: Redis -> DB -> In-memory fallback.
 
 ## Webhook Payloads
-Webhooks fire on classify, rateme, moderate events. HMAC-signed (SHA256).
+Webhooks fire on detection events and async job completion/failure. HMAC-signed (SHA256).
 Retries: immediate, then 1m, 5m, 30m (max 4 attempts).
 Headers on webhook POST:
   Content-Type: application/json
   X-Webhook-Signature: sha256=<hmac_hex>
   X-Webhook-Timestamp: <unix_timestamp>
-  X-Webhook-Event: detection.classify | detection.rateme | detection.moderate
+  X-Webhook-Event: detection.classify | detection.rateme | detection.moderate | job.completed | job.failed
 Payload:
 {
   "event": "detection.classify",
@@ -274,7 +274,7 @@ Response (200):
 ### POST /video/classify
 Classify video frame by frame. No size/duration limits for auth users.
 Fields: file (required, video file)
-Query params: model=nudenet|erax, fps=1.0 (0.1-30), max_frames=0 (0=unlimited)
+Query params: model=nudenet|erax|ensemble, fps=1.0 (0.1-30), max_frames=0 (0=unlimited), async=true (optional)
 Supported formats: .mp4, .avi, .mov, .mkv, .webm, .flv, .wmv
 Response (200):
 {
@@ -298,14 +298,14 @@ Response (200):
 ### POST /video/censor
 Censor video -- detect and blur NSFW regions. Returns MP4.
 Fields: file (required), labels (form, optional, comma-separated)
-Query params: model, fps=5.0 (0.1-30), max_frames=0, blur_radius=60 (5-200), interpolate=true
+Query params: model, fps=5.0 (0.1-30), max_frames=0, blur_radius=60 (5-200), interpolate=true, async=true (optional)
 Response (200): video/mp4 binary
 Headers: X-Video-Id, X-Frames-Analyzed, X-Detections-Found
 
 ### POST /video/scenes
 Extract NSFW scenes as compiled highlight video. Returns MP4.
 Fields: file (required)
-Query params: model, fps=2.0 (0.5-10), min_scene_duration=2.0 (>=0.5s), scene_padding=1.0 (>=0s)
+Query params: model, fps=2.0 (0.5-10), min_scene_duration=2.0 (>=0.5s), scene_padding=1.0 (>=0s), async=true (optional)
 Response (200): video/mp4 binary
 Headers:
   X-Video-Id: 20240101_120000_a1b2c3d4
@@ -314,6 +314,13 @@ Headers:
   X-Scenes-Duration: 28.40
   X-Scenes-Metadata: [{"index":0,"start":12.5,"end":22.3,"duration":9.8},...]
 Error 404: "No NSFW scenes detected in video."
+
+### Async job lifecycle
+`POST /batch` and authenticated `POST /video/classify`, `/video/censor`, and
+`/video/scenes` accept `async=true`. Response is HTTP 202 with
+`{job_id,status,status_url}`. Poll `GET /jobs/{id}`. Completed binary jobs expose
+`output_url`, downloadable via authenticated `GET /jobs/{id}/output`. Jobs are
+tenant-isolated. Catch-all webhooks receive `job.completed` or `job.failed`.
 
 ### GET /images
 List stored images.

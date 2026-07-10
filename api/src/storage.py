@@ -63,6 +63,9 @@ class _LocalStorage:
     def get_bytes(self, key: str) -> bytes:
         return self._path(key).read_bytes()
 
+    async def get_bytes_async(self, key: str) -> bytes:
+        return await anyio.to_thread.run_sync(self.get_bytes, key)
+
     def exists(self, key: str) -> bool:
         try:
             return self._path(key).is_file()
@@ -143,6 +146,9 @@ class _S3Storage:
     def get_bytes(self, key: str) -> bytes:
         resp = self._client.get_object(Bucket=self._bucket, Key=key)
         return resp["Body"].read()
+
+    async def get_bytes_async(self, key: str) -> bytes:
+        return await anyio.to_thread.run_sync(self.get_bytes, key)
 
     def exists(self, key: str) -> bool:
         from botocore.exceptions import ClientError

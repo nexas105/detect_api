@@ -9,4 +9,5 @@ bcrypt>=4.0
 python-multipart>=0.0.18
 aiosqlite>=0.21
 asyncpg>=0.30
+psycopg[binary]>=3.2
 httpx>=0.28

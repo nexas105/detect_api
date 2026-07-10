@@ -2,68 +2,18 @@
 
 from __future__ import annotations
 
-import io
-import logging
-
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
 from fastapi.responses import Response
-from PIL import Image, ImageOps
 
 from ..auth import KeyInfo, log_usage_bg, save_detection_bg, validate_api_key
 from ..demo import demo_limiter
 from ..face import anonymize_image_async, detect_faces_async
-from ..models import get_ext, store_image_async, validate_upload
+from ..models import get_ext, open_image, store_image_async, validate_upload
 from ..pose import estimate_pose_async
+from .demo import _get_demo_key
 from ..schemas import DemoFacesResponse, DemoPoseResponse, FacesResponse, PoseResponse
 
-logger = logging.getLogger("api.face_pose")
 router = APIRouter()
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────
-
-
-def _open_image(data: bytes) -> Image.Image:
-    """Open, EXIF-transpose, and convert image to RGB."""
-    try:
-        img = Image.open(io.BytesIO(data))
-        img = ImageOps.exif_transpose(img)
-    except Exception:
-        raise HTTPException(400, "Invalid image file")
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-    return img
-
-
-# ── Demo key (cached, same pattern as endpoints/demo.py) ──────────────────
-
-_demo_key_info: KeyInfo | None = None
-
-
-async def _get_demo_key() -> KeyInfo:
-    """Fetch the demo system API key from auth service (cached)."""
-    global _demo_key_info
-    if _demo_key_info:
-        return _demo_key_info
-    try:
-        from ..auth import get_http_client
-        from ..config import AUTH_SERVICE_URL
-
-        client = await get_http_client()
-        resp = await client.get(f"{AUTH_SERVICE_URL}/demo/key")
-        if resp.status_code == 200:
-            raw_key = resp.json()["key"]
-            resp2 = await client.post(
-                f"{AUTH_SERVICE_URL}/validate-key",
-                headers={"Authorization": f"Bearer {raw_key}"},
-            )
-            if resp2.status_code == 200:
-                _demo_key_info = KeyInfo(resp2.json(), raw_key)
-                logger.info("Demo key loaded (face_pose): %s", raw_key[:8])
-                return _demo_key_info
-    except Exception as e:
-        logger.warning("Could not fetch demo key: %s", e)
-    raise HTTPException(503, "Demo service not ready")
 
 
 # ── Authenticated Endpoints ───────────────────────────────────────────────
@@ -88,7 +38,7 @@ async def anonymize(
     """
     data = await file.read()
     validate_upload(data)
-    img = _open_image(data)
+    img = open_image(data)
 
     faces = await detect_faces_async(img)
     anon_bytes = await anonymize_image_async(img, faces, blur_radius)
@@ -117,7 +67,7 @@ async def faces(
     """
     data = await file.read()
     validate_upload(data)
-    img = _open_image(data)
+    img = open_image(data)
 
     face_list = await detect_faces_async(img)
 
@@ -141,7 +91,7 @@ async def pose(
     """
     data = await file.read()
     validate_upload(data)
-    img = _open_image(data)
+    img = open_image(data)
 
     pose_result = await estimate_pose_async(img)
 
@@ -169,10 +119,10 @@ async def demo_anonymize(
 
     Same as /anonymize but with IP-based rate limiting and a 10MB file size cap.
     """
-    demo_limiter.check_image(request)
+    await demo_limiter.check_image(request)
     data = await file.read()
     validate_upload(data, max_size=10 * 1024 * 1024)
-    img = _open_image(data)
+    img = open_image(data)
 
     faces = await detect_faces_async(img)
     anon_bytes = await anonymize_image_async(img, faces, blur_radius)
@@ -198,10 +148,10 @@ async def demo_faces(
 
     Same as /faces but with IP-based rate limiting and a 10MB file size cap.
     """
-    demo_limiter.check_image(request)
+    await demo_limiter.check_image(request)
     data = await file.read()
     validate_upload(data, max_size=10 * 1024 * 1024)
-    img = _open_image(data)
+    img = open_image(data)
 
     face_list = await detect_faces_async(img)
 
@@ -212,7 +162,7 @@ async def demo_faces(
 
     return {
         "image_id": image_id, "faces": face_list, "count": len(face_list),
-        "demo": True, "limits": demo_limiter.get_remaining(request),
+        "demo": True, "limits": await demo_limiter.get_remaining(request),
     }
 
 
@@ -225,10 +175,10 @@ async def demo_pose(
 
     Same as /pose but with IP-based rate limiting and a 10MB file size cap.
     """
-    demo_limiter.check_image(request)
+    await demo_limiter.check_image(request)
     data = await file.read()
     validate_upload(data, max_size=10 * 1024 * 1024)
-    img = _open_image(data)
+    img = open_image(data)
 
     pose_result = await estimate_pose_async(img)
 
@@ -239,5 +189,5 @@ async def demo_pose(
 
     return {
         "image_id": image_id, "pose": pose_result,
-        "demo": True, "limits": demo_limiter.get_remaining(request),
+        "demo": True, "limits": await demo_limiter.get_remaining(request),
     }

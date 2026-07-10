@@ -170,33 +170,6 @@ interface Detection {
   model?: string;
 }
 
-function iou(a: number[], b: number[]): number {
-  const [ax, ay, aw, ah] = a;
-  const [bx, by, bw, bh] = b;
-  const x1 = Math.max(ax, bx), y1 = Math.max(ay, by);
-  const x2 = Math.min(ax + aw, bx + bw), y2 = Math.min(ay + ah, by + bh);
-  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
-  const union = aw * ah + bw * bh - inter;
-  return union > 0 ? inter / union : 0;
-}
-
-function mergeDetections(nnDets: Detection[], exDets: Detection[]): Detection[] {
-  const merged = [...nnDets];
-  for (const exDet of exDets) {
-    const isDuplicate = merged.some(
-      (m) =>
-        m.label === exDet.label &&
-        m.box &&
-        exDet.box &&
-        iou(m.box, exDet.box) > 0.3
-    );
-    if (!isDuplicate) {
-      merged.push(exDet);
-    }
-  }
-  return merged.sort((a, b) => b.score - a.score);
-}
-
 interface SingleResult {
   model?: string;
   detections: Detection[];
@@ -391,69 +364,10 @@ export default function DemoPage() {
         return;
       }
 
-      // "Both" model for single-image classify or censor
-      const useBoth = model === 'both' && !isVideo(file) && !isArchive(file) && mode !== 'rateme';
-
-      if (useBoth) {
-        const formData1 = new FormData();
-        formData1.append('file', file);
-        const formData2 = new FormData();
-        formData2.append('file', file);
-
-        const classifyBase = mode === 'censor' ? `${API_URL}/demo/classify` : `${API_URL}/demo/classify`;
-        const [nnRes, exRes] = await Promise.all([
-          fetch(`${classifyBase}?model=nudenet`, { method: 'POST', body: formData1 }),
-          fetch(`${classifyBase}?model=erax`, { method: 'POST', body: formData2 }),
-        ]);
-
-        if (!nnRes.ok) {
-          const err = await nnRes.json().catch(() => ({}));
-          throw new Error(err.detail || `NudeNet request failed (${nnRes.status})`);
-        }
-        if (!exRes.ok) {
-          const err = await exRes.json().catch(() => ({}));
-          throw new Error(err.detail || `EraX request failed (${exRes.status})`);
-        }
-
-        const nnData: SingleResult = await nnRes.json();
-        const exData: SingleResult = await exRes.json();
-
-        // Update limits from whichever response has them
-        if ((nnData as any).limits) setLimits((nnData as any).limits);
-        else if ((exData as any).limits) setLimits((exData as any).limits);
-
-        const nnDets = nnData.detections.map((d) => ({ ...d, model: 'nudenet' as string }));
-        const exDets = exData.detections.map((d) => ({ ...d, model: 'erax' as string }));
-        const merged = mergeDetections(nnDets, exDets);
-
-        const mergedData: SingleResult = {
-          ...nnData,
-          model: 'both',
-          detections: merged,
-          age: nnData.age || exData.age,
-          deepfake: nnData.deepfake || exData.deepfake,
-          clothing: nnData.clothing || exData.clothing,
-        };
-
-        if (mode === 'censor') {
-          setResult({ type: 'single', data: mergedData });
-          if (mergedData.detections.length > 0) {
-            try {
-              const { generateCensorPreview } = await import('@/lib/censor-preview');
-              const previewBlob = await generateCensorPreview(file, mergedData.detections);
-              if (censorPreviewUrl) URL.revokeObjectURL(censorPreviewUrl);
-              setCensorPreviewUrl(URL.createObjectURL(previewBlob));
-            } catch (e) {
-              console.error('Failed to generate censor preview', e);
-            }
-          }
-        } else {
-          setResult({ type: 'single', data: mergedData });
-        }
-      } else {
-        // Single model path
+      // Single model or server-side ensemble path.
+      {
         let endpoint: string;
-        const actualModel = model === 'both' ? 'nudenet' : model;
+        const actualModel = model === 'both' ? 'ensemble' : model;
         if (mode === 'rateme') {
           endpoint = `${API_URL}/demo/rateme`;
         } else if (mode === 'censor') {

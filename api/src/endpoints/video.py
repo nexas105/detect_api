@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -10,21 +11,40 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import Response
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import JSONResponse, Response
 
-from ..auth import KeyInfo, get_http_client, log_usage_bg, save_detection_bg, validate_api_key
-from ..config import AUTH_SERVICE_URL, MAX_VIDEO_DURATION, MAX_VIDEO_SIZE
+from ..auth import KeyInfo, log_usage_bg, save_detection_bg, validate_api_key
+from ..config import MAX_VIDEO_DURATION, MAX_VIDEO_SIZE
 from ..demo import demo_limiter
+from .demo import _get_demo_key
 from ..models import (
     DEFAULT_CENSOR, ModelName, preprocess, run_detection_async,
 )
+from ..jobs import JobResult, create_job, run_job
 from ..storage import build_key, storage
 from ..video import VIDEO_EXTS, censor_video, extract_frames, extract_scenes, get_video_info, identify_scenes
-from ..schemas import DemoVideoClassifyResponse, VideoClassifyResponse
+from ..schemas import DemoVideoClassifyResponse, JobAcceptedResponse, VideoClassifyResponse
 
 logger = logging.getLogger("api.video")
 router = APIRouter()
+
+# ponytail: fixed cap; frame inference is lock-serialized in models.py, so this
+# overlaps frame preprocess + executor dispatch, not the model itself.
+_FRAME_CONCURRENCY = 4
+
+
+async def _detect_frames(frames, model: ModelName) -> list[dict]:
+    """Run detection on extracted (timestamp, image) frames, bounded-concurrent, order preserved."""
+    sem = asyncio.Semaphore(_FRAME_CONCURRENCY)
+
+    async def _one(timestamp, pil_img):
+        async with sem:
+            img, scale = preprocess_frame(pil_img)
+            detections = await run_detection_async(img, model, scale)
+            return {"timestamp": timestamp, "detections": detections}
+
+    return list(await asyncio.gather(*(_one(ts, im) for ts, im in frames)))
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -44,14 +64,6 @@ def _validate_video_upload(data: bytes, filename: str, max_size: int | None = MA
 
 def _video_ext(filename: str) -> str:
     return Path(filename).suffix.lower() if filename and "." in filename else ".mp4"
-
-
-def _store_video(data: bytes, filename: str, category: str) -> tuple[str, str]:
-    """Store video (synchronous; use _store_video_async in request handlers)."""
-    video_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    key = build_key(category, video_id, _video_ext(filename))
-    storage.put_bytes(key, data, content_type="video/mp4")
-    return video_id, key
 
 
 async def _store_video_async(data: bytes, filename: str, category: str) -> tuple[str, str]:
@@ -110,12 +122,8 @@ async def _process_video_classify(
     if not frames:
         raise HTTPException(400, "Could not extract frames from video")
 
-    # Run detection on each frame
-    frame_results = []
-    for timestamp, pil_img in frames:
-        img, scale = preprocess_frame(pil_img)
-        detections = await run_detection_async(img, model, scale)
-        frame_results.append({"timestamp": timestamp, "detections": detections})
+    # Run detection on each frame (bounded-concurrent)
+    frame_results = await _detect_frames(frames, model)
 
     # Store original video
     video_id, orig_path = await _store_video_async(data, filename, "originals")
@@ -138,6 +146,43 @@ async def _process_video_classify(
     return video_id, result
 
 
+async def _process_video_censor(
+    data: bytes,
+    filename: str,
+    model: ModelName,
+    fps: float,
+    max_frames: int,
+    labels: str | None,
+    blur_radius: int,
+    interpolate: bool,
+) -> tuple[str, bytes, dict, int, str]:
+    """Core video censoring shared by synchronous and async requests."""
+    import asyncio
+
+    video_id, classify_result = await _process_video_classify(
+        data, filename, model, fps, max_frames,
+    )
+    censor_labels = (
+        [label.strip() for label in labels.split(",") if label.strip()]
+        if labels else DEFAULT_CENSOR[model]
+    )
+    detections_per_frame: list[tuple[float, list[dict]]] = []
+    total_detections = 0
+    for frame in classify_result["frames"]:
+        filtered = [d for d in frame["detections"] if d["label"] in censor_labels]
+        if filtered:
+            detections_per_frame.append((frame["timestamp"], filtered))
+            total_detections += len(filtered)
+
+    loop = asyncio.get_running_loop()
+    censored_bytes = await loop.run_in_executor(
+        None, censor_video, data, detections_per_frame, blur_radius, interpolate,
+    )
+    censored_path = build_key("censored", video_id, ".mp4")
+    await storage.put_bytes_async(censored_path, censored_bytes, content_type="video/mp4")
+    return video_id, censored_bytes, classify_result, total_detections, censored_path
+
+
 def preprocess_frame(pil_img):
     """Preprocess a PIL image frame for detection (reuses image preprocess logic)."""
     import io
@@ -156,42 +201,22 @@ def preprocess_frame(pil_img):
     return img, scale
 
 
-# ── Cached demo key (same pattern as demo.py) ─────────────────────────────
-
-_demo_key_info: KeyInfo | None = None
-
-
-async def _get_demo_key() -> KeyInfo:
-    """Fetch the demo system API key from auth service (cached)."""
-    global _demo_key_info
-    if _demo_key_info:
-        return _demo_key_info
-    try:
-        client = await get_http_client()
-        resp = await client.get(f"{AUTH_SERVICE_URL}/demo/key")
-        if resp.status_code == 200:
-            raw_key = resp.json()["key"]
-            resp2 = await client.post(
-                f"{AUTH_SERVICE_URL}/validate-key",
-                headers={"Authorization": f"Bearer {raw_key}"},
-            )
-            if resp2.status_code == 200:
-                _demo_key_info = KeyInfo(resp2.json(), raw_key)
-                return _demo_key_info
-    except Exception as e:
-        logger.warning("Could not fetch demo key: %s", e)
-    raise HTTPException(503, "Demo service not ready")
-
-
 # ── Authenticated Endpoints ───────────────────────────────────────────────
 
 
-@router.post("/video/classify", response_model=VideoClassifyResponse, tags=["Video"])
+@router.post(
+    "/video/classify",
+    response_model=VideoClassifyResponse | JobAcceptedResponse,
+    tags=["Video"],
+    responses={202: {"model": JobAcceptedResponse, "description": "Async job accepted"}},
+)
 async def video_classify(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     model: ModelName = Query(ModelName.nudenet),
     fps: float = Query(1.0, ge=0.1, le=30.0, description="Frames per second to analyze"),
     max_frames: int = Query(0, ge=0, description="Max frames (0=unlimited)"),
+    async_mode: bool = Query(False, alias="async", description="Return a job_id immediately"),
     key_info: KeyInfo = Depends(validate_api_key),
 ):
     """Classify a video frame-by-frame for NSFW content.
@@ -203,10 +228,32 @@ async def video_classify(
     size limits for authenticated users.
     """
     data = await file.read()
-    _validate_video_upload(data, file.filename or "video.mp4", max_size=None)  # unlimited for auth
+    filename = file.filename or "video.mp4"
+    _validate_video_upload(data, filename, max_size=None)  # unlimited for auth
+
+    if async_mode:
+        job = await create_job(key_info, "video/classify", filename, data)
+
+        async def worker(job_data: bytes) -> JobResult:
+            video_id, result = await _process_video_classify(
+                job_data, filename, model, fps, max_frames,
+            )
+            save_detection_bg(
+                key_info, video_id, "video-classify", model.value,
+                [d for frame in result["frames"] for d in frame["detections"]],
+                original_path=f"originals/{video_id}",
+            )
+            return JobResult(data=result)
+
+        background_tasks.add_task(run_job, job.id, key_info.raw_key, worker)
+        log_usage_bg(key_info, "/video/classify?async=true", "POST", 202)
+        return JSONResponse(
+            status_code=202,
+            content={"job_id": job.id, "status": "queued", "status_url": f"/jobs/{job.id}"},
+        )
 
     video_id, result = await _process_video_classify(
-        data, file.filename or "video.mp4", model, fps, max_frames,
+        data, filename, model, fps, max_frames,
     )
 
     log_usage_bg(key_info, "/video/classify", "POST", 200)
@@ -222,9 +269,13 @@ async def video_classify(
 @router.post(
     "/video/censor",
     tags=["Video"],
-    responses={200: {"content": {"video/mp4": {}}, "description": "Censored MP4 video with NSFW regions blurred"}},
+    responses={
+        200: {"content": {"video/mp4": {}}, "description": "Censored MP4 video with NSFW regions blurred"},
+        202: {"model": JobAcceptedResponse, "description": "Async job accepted"},
+    },
 )
 async def video_censor(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     model: ModelName = Query(ModelName.nudenet),
     fps: float = Query(5.0, ge=0.1, le=30.0, description="Higher = smoother censoring, default 5"),
@@ -232,6 +283,7 @@ async def video_censor(
     labels: Optional[str] = Form(None),
     blur_radius: int = Query(60, ge=5, le=200),
     interpolate: bool = Query(True, description="Interpolate censoring between analyzed frames"),
+    async_mode: bool = Query(False, alias="async", description="Return a job_id immediately"),
     key_info: KeyInfo = Depends(validate_api_key),
 ):
     """Censor NSFW regions in a video using Gaussian blur.
@@ -242,38 +294,47 @@ async def video_censor(
     Returns the censored video as H.264 MP4. No duration or file size limits
     for authenticated users.
     """
-    import asyncio
-
     data = await file.read()
-    _validate_video_upload(data, file.filename or "video.mp4", max_size=None)
+    filename = file.filename or "video.mp4"
+    _validate_video_upload(data, filename, max_size=None)
 
-    video_id, classify_result = await _process_video_classify(
-        data, file.filename or "video.mp4", model, fps, max_frames,
+    if async_mode:
+        job = await create_job(key_info, "video/censor", filename, data)
+
+        async def worker(job_data: bytes) -> JobResult:
+            video_id, output, classify_result, total, censored_path = await _process_video_censor(
+                job_data, filename, model, fps, max_frames, labels, blur_radius, interpolate,
+            )
+            save_detection_bg(
+                key_info, video_id, "video-censor", model.value,
+                [d for frame in classify_result["frames"] for d in frame["detections"]],
+                original_path=f"originals/{video_id}", censored_path=censored_path,
+            )
+            return JobResult(
+                data={
+                    "video_id": video_id,
+                    "model": model.value,
+                    "settings": classify_result["settings"],
+                    "summary": classify_result["summary"],
+                    "detections_found": total,
+                },
+                output_bytes=output,
+                output_suffix=".mp4",
+                output_content_type="video/mp4",
+            )
+
+        background_tasks.add_task(run_job, job.id, key_info.raw_key, worker)
+        log_usage_bg(key_info, "/video/censor?async=true", "POST", 202)
+        return JSONResponse(
+            status_code=202,
+            content={"job_id": job.id, "status": "queued", "status_url": f"/jobs/{job.id}"},
+        )
+
+    video_id, censored_bytes, classify_result, total_detections, censored_path = (
+        await _process_video_censor(
+            data, filename, model, fps, max_frames, labels, blur_radius, interpolate,
+        )
     )
-
-    # Determine which labels to censor
-    censor_labels = (
-        [l.strip() for l in labels.split(",") if l.strip()]
-        if labels else DEFAULT_CENSOR[model]
-    )
-
-    # Filter detections to only censor specified labels
-    detections_per_frame: list[tuple[float, list[dict]]] = []
-    total_detections = 0
-    for frame in classify_result["frames"]:
-        filtered = [d for d in frame["detections"] if d["label"] in censor_labels]
-        if filtered:
-            detections_per_frame.append((frame["timestamp"], filtered))
-            total_detections += len(filtered)
-
-    # Run censoring in thread pool
-    censored_bytes = await asyncio.get_event_loop().run_in_executor(
-        None, censor_video, data, detections_per_frame, blur_radius, interpolate,
-    )
-
-    # Store censored video
-    censored_path = build_key("censored", video_id, ".mp4")
-    await storage.put_bytes_async(censored_path, censored_bytes, content_type="video/mp4")
 
     log_usage_bg(key_info, "/video/censor", "POST", 200)
     save_detection_bg(
@@ -311,7 +372,7 @@ async def demo_video_classify(
     max 30-second video, max 20 frames, 50MB file size cap, and IP-based
     rate limiting.
     """
-    demo_limiter.check_image(request)
+    await demo_limiter.check_image(request)
 
     data = await file.read()
     _validate_video_upload(data, file.filename or "video.mp4", max_size=50 * 1024 * 1024)
@@ -342,7 +403,7 @@ async def demo_video_classify(
         pass  # non-critical
 
     result["demo"] = True
-    result["limits"] = demo_limiter.get_remaining(request)
+    result["limits"] = await demo_limiter.get_remaining(request)
 
     return result
 
@@ -381,12 +442,8 @@ async def _process_video_scenes(
     if not frames:
         raise HTTPException(400, "Could not extract frames from video")
 
-    # Run detection on each frame
-    frame_results = []
-    for timestamp, pil_img in frames:
-        img, scale = preprocess_frame(pil_img)
-        detections = await run_detection_async(img, model, scale)
-        frame_results.append({"timestamp": timestamp, "detections": detections})
+    # Run detection on each frame (bounded-concurrent)
+    frame_results = await _detect_frames(frames, model)
 
     # Identify NSFW scenes
     scenes = identify_scenes(
@@ -412,14 +469,19 @@ async def _process_video_scenes(
 @router.post(
     "/video/scenes",
     tags=["Video"],
-    responses={200: {"content": {"video/mp4": {}}, "description": "Compiled MP4 video containing only NSFW scenes"}},
+    responses={
+        200: {"content": {"video/mp4": {}}, "description": "Compiled MP4 video containing only NSFW scenes"},
+        202: {"model": JobAcceptedResponse, "description": "Async job accepted"},
+    },
 )
 async def video_scenes(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     model: ModelName = Query(ModelName.nudenet),
     fps: float = Query(2.0, ge=0.5, le=10.0, description="Frames per second to analyze"),
     min_scene_duration: float = Query(2.0, ge=0.5, description="Min scene length in seconds"),
     scene_padding: float = Query(1.0, ge=0, description="Seconds to add before/after each scene"),
+    async_mode: bool = Query(False, alias="async", description="Return a job_id immediately"),
     key_info: KeyInfo = Depends(validate_api_key),
 ):
     """Extract NSFW scenes from a video and return a compiled highlight reel.
@@ -431,10 +493,50 @@ async def video_scenes(
     duration and padding around each scene boundary.
     """
     data = await file.read()
-    _validate_video_upload(data, file.filename or "video.mp4", max_size=None)
+    filename = file.filename or "video.mp4"
+    _validate_video_upload(data, filename, max_size=None)
+
+    if async_mode:
+        job = await create_job(key_info, "video/scenes", filename, data)
+
+        async def worker(job_data: bytes) -> JobResult:
+            video_id, output, scenes, info = await _process_video_scenes(
+                job_data, filename, model, fps,
+                max_frames=0,
+                min_scene_duration=min_scene_duration,
+                scene_padding=scene_padding,
+            )
+            await storage.put_bytes_async(
+                build_key("scenes", video_id, ".mp4"), output, content_type="video/mp4"
+            )
+            metadata = [
+                {"index": i, "start": round(start, 2), "end": round(end, 2),
+                 "duration": round(end - start, 2)}
+                for i, (start, end) in enumerate(scenes)
+            ]
+            return JobResult(
+                data={
+                    "video_id": video_id,
+                    "model": model.value,
+                    "video_info": info,
+                    "scenes": metadata,
+                    "scenes_found": len(scenes),
+                    "scenes_duration": round(sum(end - start for start, end in scenes), 2),
+                },
+                output_bytes=output,
+                output_suffix=".mp4",
+                output_content_type="video/mp4",
+            )
+
+        background_tasks.add_task(run_job, job.id, key_info.raw_key, worker)
+        log_usage_bg(key_info, "/video/scenes?async=true", "POST", 202)
+        return JSONResponse(
+            status_code=202,
+            content={"job_id": job.id, "status": "queued", "status_url": f"/jobs/{job.id}"},
+        )
 
     video_id, compiled_bytes, scenes, info = await _process_video_scenes(
-        data, file.filename or "video.mp4", model, fps,
+        data, filename, model, fps,
         max_frames=0, min_scene_duration=min_scene_duration,
         scene_padding=scene_padding,
     )
@@ -489,7 +591,7 @@ async def demo_video_scenes(
     """
     import asyncio
 
-    demo_limiter.check_image(request)
+    await demo_limiter.check_image(request)
 
     data = await file.read()
     _validate_video_upload(data, file.filename or "video.mp4", max_size=50 * 1024 * 1024)

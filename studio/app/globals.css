@@ -1,0 +1,70 @@
+/* Studio v2 — "Inspection Console" design tokens.
+   Loaded after Mantine styles in layout.tsx so these overrides win. */
+
+:root {
+  /* Light "Lab" */
+  --bg: #f7f8fa;
+  --surface: #ffffff;
+  --surface-2: #f0f2f5;
+  --hairline: #e2e6ec;
+  --text-hi: #12161c;
+  --text-lo: #5a6472;
+
+  --accent: #38bdf8;
+
+  /* Verdict trio — used by moderate/detections and the dashboard legend. */
+  --verdict-allow: #34d399;
+  --verdict-flag: #fbbf24;
+  --verdict-block: #fb7185;
+
+  /* Make every Mantine `withBorder` component hairline app-wide. */
+  --mantine-color-default-border: var(--hairline);
+}
+
+[data-mantine-color-scheme='dark'] {
+  --bg: #0e1116;
+  --surface: #171c24;
+  --surface-2: #1f2630;
+  --hairline: #262e3a;
+  --text-hi: #e6eaf0;
+  --text-lo: #8a94a6;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text-hi);
+}
+
+/* Data-mono: API keys, scores, hashes, IDs, labels, timestamps. Tabular figures. */
+.data-mono {
+  font-family: var(--mantine-font-family-monospace);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  letter-spacing: -0.01em;
+}
+
+/* Sidebar nav items — hover handled in CSS (inline styles can't). */
+.studio-nav-item {
+  transition: background 120ms ease, color 120ms ease;
+}
+.studio-nav-item:hover {
+  background: var(--surface-2);
+}
+
+/* Visible keyboard focus everywhere. */
+:where(a, button, [role='button'], [tabindex], input, select, textarea, summary):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -3,19 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 from functools import partial
 
 import numpy as np
 import torch
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from PIL import Image, ImageOps
+from PIL import Image
 
 from ..auth import KeyInfo, log_usage_bg, validate_api_key
 from ..clip_scorer import _load_clip
 from ..demo import demo_limiter
-from ..models import get_ext, store_image_async, validate_upload
+from ..models import get_ext, open_image, store_image_async, validate_upload
 from ..schemas import (
     CompareResponse, DemoCompareResponse, DemoEmbedResponse, DemoTagResponse,
     EmbedResponse, TagResponse,
@@ -30,18 +29,6 @@ EMBEDDING_DIM = 768
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
-
-
-def _open_image(data: bytes) -> Image.Image:
-    """Open and normalise an uploaded image."""
-    try:
-        img = Image.open(io.BytesIO(data))
-        img = ImageOps.exif_transpose(img)
-    except Exception:
-        raise HTTPException(400, "Invalid image file")
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-    return img
 
 
 def _get_image_embedding(img: Image.Image, normalize: bool = True) -> list[float]:
@@ -100,7 +87,7 @@ async def embed(
     data = await file.read()
     validate_upload(data)
 
-    img = _open_image(data)
+    img = open_image(data)
     loop = asyncio.get_event_loop()
     embedding = await loop.run_in_executor(None, partial(_get_image_embedding, img, normalize))
 
@@ -133,12 +120,14 @@ async def compare(
     validate_upload(data1)
     validate_upload(data2)
 
-    img1 = _open_image(data1)
-    img2 = _open_image(data2)
+    img1 = open_image(data1)
+    img2 = open_image(data2)
 
     loop = asyncio.get_event_loop()
-    emb1 = await loop.run_in_executor(None, partial(_get_image_embedding, img1, True))
-    emb2 = await loop.run_in_executor(None, partial(_get_image_embedding, img2, True))
+    emb1, emb2 = await asyncio.gather(
+        loop.run_in_executor(None, partial(_get_image_embedding, img1, True)),
+        loop.run_in_executor(None, partial(_get_image_embedding, img2, True)),
+    )
 
     a1, a2 = np.array(emb1), np.array(emb2)
     similarity = float(np.dot(a1, a2) / (np.linalg.norm(a1) * np.linalg.norm(a2)))
@@ -177,7 +166,7 @@ async def tag(
     data = await file.read()
     validate_upload(data)
 
-    img = _open_image(data)
+    img = open_image(data)
     loop = asyncio.get_event_loop()
     tags = await loop.run_in_executor(None, partial(_score_labels, img, parsed))
 
@@ -209,11 +198,11 @@ async def demo_embed(
 
     Same as /embed but with IP-based rate limiting and a 10MB file size cap.
     """
-    demo_limiter.check_image(request)
+    await demo_limiter.check_image(request)
     data = await file.read()
     validate_upload(data, max_size=10 * 1024 * 1024)
 
-    img = _open_image(data)
+    img = open_image(data)
     loop = asyncio.get_event_loop()
     embedding = await loop.run_in_executor(None, partial(_get_image_embedding, img, normalize))
 
@@ -228,7 +217,7 @@ async def demo_embed(
         "model": CLIP_MODEL_NAME,
         "normalized": normalize,
         "demo": True,
-        "limits": demo_limiter.get_remaining(request),
+        "limits": await demo_limiter.get_remaining(request),
     }
 
 
@@ -243,19 +232,21 @@ async def demo_compare(
     Same as /compare but with IP-based rate limiting (counts as 2 images)
     and a 10MB file size cap per image.
     """
-    demo_limiter.check_image(request)
-    demo_limiter.check_image(request)
+    await demo_limiter.check_image(request)
+    await demo_limiter.check_image(request)
     data1 = await file1.read()
     data2 = await file2.read()
     validate_upload(data1, max_size=10 * 1024 * 1024)
     validate_upload(data2, max_size=10 * 1024 * 1024)
 
-    img1 = _open_image(data1)
-    img2 = _open_image(data2)
+    img1 = open_image(data1)
+    img2 = open_image(data2)
 
     loop = asyncio.get_event_loop()
-    emb1 = await loop.run_in_executor(None, partial(_get_image_embedding, img1, True))
-    emb2 = await loop.run_in_executor(None, partial(_get_image_embedding, img2, True))
+    emb1, emb2 = await asyncio.gather(
+        loop.run_in_executor(None, partial(_get_image_embedding, img1, True)),
+        loop.run_in_executor(None, partial(_get_image_embedding, img2, True)),
+    )
 
     a1, a2 = np.array(emb1), np.array(emb2)
     similarity = float(np.dot(a1, a2) / (np.linalg.norm(a1) * np.linalg.norm(a2)))
@@ -269,7 +260,7 @@ async def demo_compare(
         "is_similar": similarity >= 0.85,
         "embedding_model": CLIP_MODEL_NAME,
         "demo": True,
-        "limits": demo_limiter.get_remaining(request),
+        "limits": await demo_limiter.get_remaining(request),
     }
 
 
@@ -283,7 +274,7 @@ async def demo_tag(
 
     Same as /tag but with IP-based rate limiting and a 10MB file size cap.
     """
-    demo_limiter.check_image(request)
+    await demo_limiter.check_image(request)
     parsed = [l.strip() for l in labels.split(",") if l.strip()]
     if not parsed:
         raise HTTPException(400, "No labels provided")
@@ -296,7 +287,7 @@ async def demo_tag(
     data = await file.read()
     validate_upload(data, max_size=10 * 1024 * 1024)
 
-    img = _open_image(data)
+    img = open_image(data)
     loop = asyncio.get_event_loop()
     tags = await loop.run_in_executor(None, partial(_score_labels, img, parsed))
 
@@ -309,5 +300,5 @@ async def demo_tag(
         "tags": tags,
         "model": CLIP_MODEL_NAME,
         "demo": True,
-        "limits": demo_limiter.get_remaining(request),
+        "limits": await demo_limiter.get_remaining(request),
     }

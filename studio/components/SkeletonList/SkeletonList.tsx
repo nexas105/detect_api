@@ -8,7 +8,7 @@ export interface SkeletonListProps {
   radius?: number | string;
 }
 
-export function SkeletonList({ count = 5, height = 56, radius = 'md' }: SkeletonListProps) {
+export function SkeletonList({ count = 5, height = 56, radius = 'sm' }: SkeletonListProps) {
   return (
     <Stack gap="xs">
       {Array.from({ length: count }).map((_, i) => (

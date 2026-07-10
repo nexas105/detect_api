@@ -22,6 +22,14 @@ from pathlib import Path
 MODEL_DIR = Path(os.getenv("MODEL_DIR", os.path.expanduser("~/.nudenet_api/models")))
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
+ERAX_MODEL_SIZE = os.getenv("ERAX_MODEL_SIZE", "m").strip().lower()
+if ERAX_MODEL_SIZE not in {"n", "s", "m"}:
+    raise ValueError("ERAX_MODEL_SIZE must be one of: n, s, m")
+ERAX_MODEL_REVISION = os.getenv(
+    "ERAX_MODEL_REVISION", "90878ab981060833413ae1a24df72f5e1fff66bc"
+).strip()
+ERAX_MODEL_FILENAME = f"erax-anti-nsfw-yolo11{ERAX_MODEL_SIZE}-v1.1.pt"
+
 MODELS = {
     "nudenet": {
         "filename": "640m.onnx",
@@ -33,12 +41,13 @@ MODELS = {
         "fallback": "bundled_320n",
     },
     "erax": {
-        "filename": "erax-anti-nsfw-yolo11s-v1.1.pt",
-        "size_mb": 18,
+        "filename": ERAX_MODEL_FILENAME,
+        "size_mb": {"n": 6, "s": 19, "m": 39}[ERAX_MODEL_SIZE],
         "legacy_path": None,
         "source": "huggingface",
         "repo_id": "erax-ai/EraX-Anti-NSFW-V1.1",
-        "hf_filename": "erax-anti-nsfw-yolo11s-v1.1.pt",
+        "hf_filename": ERAX_MODEL_FILENAME,
+        "revision": ERAX_MODEL_REVISION,
         "fallback": None,
     },
     "clip": {
@@ -190,6 +199,7 @@ def _download_huggingface(model_cfg: dict, target: Path) -> bool:
         cached_path = hf_hub_download(
             repo_id=model_cfg["repo_id"],
             filename=model_cfg["hf_filename"],
+            revision=model_cfg.get("revision"),
         )
         shutil.copy2(cached_path, str(target))
         return True
@@ -318,12 +328,3 @@ if __name__ == "__main__":
     if not all(results.values()):
         failed = [k for k, v in results.items() if not v]
         print(f"\n⚠ Failed: {', '.join(failed)}")
-else:
-    # Also run when imported as module (python -m api.src.download_model)
-    print(f"Model directory: {MODEL_DIR}")
-    for name in MODELS:
-        get_model(name)
-    print(f"\nModels in {MODEL_DIR}:")
-    for f in sorted(MODEL_DIR.iterdir()):
-        size_mb = f.stat().st_size / (1024 * 1024)
-        print(f"  {f.name} ({size_mb:.1f} MB)")

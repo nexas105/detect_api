@@ -12,7 +12,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -42,3 +42,22 @@ class DetectionCache(APIBase):
     __table_args__ = (
         UniqueConstraint("hash", "model_version", "endpoint", name="uq_detection_cache_hash_model_endpoint"),
     )
+
+
+class AsyncJob(APIBase):
+    """Tenant-scoped metadata for asynchronous batch and video jobs."""
+
+    __tablename__ = "async_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    endpoint: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued", index=True)
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    input_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    output_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

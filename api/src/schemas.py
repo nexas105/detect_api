@@ -14,6 +14,8 @@ class Detection(BaseModel):
     box: list[int] = Field(..., description="Bounding box [x, y, width, height]")
     box_format: str = Field(default="xywh", description="Box coordinate format")
     model: str | None = Field(default=None, description="Source model (nudenet/erax)")
+    concept: str | None = Field(default=None, description="Normalized cross-model concept")
+    sources: list[str] | None = Field(default=None, description="Models supporting this detection")
 
 
 class AgeAnalysis(BaseModel):
@@ -298,6 +300,26 @@ class ModelInfo(BaseModel):
 
 class ModelsResponse(BaseModel):
     models: list[ModelInfo]
+
+
+# ── Async Jobs ───────────────────────────────────────────────────────────
+
+
+class JobAcceptedResponse(BaseModel):
+    job_id: str
+    status: str = "queued"
+    status_url: str
+
+
+class JobStatusResponse(JobAcceptedResponse):
+    endpoint: str
+    progress: int = Field(ge=0, le=100)
+    result: dict | None = None
+    error: str | None = None
+    output_url: str | None = None
+    created_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
 
 
 # ── Images / Storage ─────────────────────────────────────────────────────

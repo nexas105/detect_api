@@ -1,0 +1,40 @@
+# Runtime / data
+db/data/
+storage/
+api/storage/
+
+# Secrets
+.env
+.env.local
+.env.prod
+.env.coolify
+.env.*
+!.env.example
+
+# VCS / editor / OS
+.git/
+.gitignore
+.DS_Store
+.claude/
+.CLAUDE.md
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+**/.venv/
+**/venv/
+
+# Node
+**/node_modules/
+**/.next/
+**/.yarn/cache/
+**/.yarn/install-state.gz
+
+# Model artifacts (large; downloaded at runtime)
+*.onnx
+*.pt
+*.tar.xz
+*.gz

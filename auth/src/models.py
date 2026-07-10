@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum as PyEnum
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Boolean, Text, UniqueConstraint
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, String, Boolean, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from db.src.database import Base
@@ -114,6 +114,11 @@ class UsageLog(Base):
     status_code: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
 
+    # Composite index for time-windowed per-tenant usage stats.
+    __table_args__ = (
+        Index("ix_usage_logs_tenant_created", "tenant_id", "created_at"),
+    )
+
 
 class DetectionResult(Base):
     __tablename__ = "detection_results"
@@ -132,6 +137,11 @@ class DetectionResult(Base):
 
     api_key: Mapped[APIKey] = relationship()
     tenant: Mapped[Tenant] = relationship()
+
+    # Composite index for time-windowed per-tenant detection queries.
+    __table_args__ = (
+        Index("ix_detection_results_tenant_created", "tenant_id", "created_at"),
+    )
 
 
 class DetectionCache(Base):
@@ -208,3 +218,22 @@ class WebhookDelivery(Base):
     succeeded: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AsyncJob(Base):
+    """Persistent state for asynchronous batch and video processing."""
+
+    __tablename__ = "async_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("tenants.id"), nullable=False, index=True)
+    endpoint: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued", index=True)
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    input_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    output_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from .auth import close_http_client
 from .config import AUTH_SERVICE_URL, CORS_ORIGINS, CORS_ORIGIN_REGEX
 from .models import get_nudenet
+from .jobs import fail_interrupted_jobs
 from .ratelimit import rate_limiter
 from .worker_pool import init_pool, shutdown_pool
 
@@ -25,6 +26,7 @@ logger = logging.getLogger("api")
 async def lifespan(app: FastAPI):
     init_pool()  # ML worker pool (if ML_WORKERS > 0)
     get_nudenet()  # warmup main process models
+    await fail_interrupted_jobs()
     await rate_limiter.init(AUTH_SERVICE_URL)
     logger.info("API ready")
     yield
@@ -46,6 +48,7 @@ tags_metadata = [
     {"name": "Demo", "description": "Free demo endpoints with IP-based rate limiting (no API key required)"},
     {"name": "System", "description": "Health checks and model information"},
     {"name": "Storage", "description": "Image storage and retrieval"},
+    {"name": "Jobs", "description": "Asynchronous batch and video job status"},
 ]
 
 app = FastAPI(
@@ -63,13 +66,16 @@ app = FastAPI(
 
 from fastapi.middleware.cors import CORSMiddleware
 
-# Always enable CORS — if no explicit origins configured, allow all origins.
-# In production set CORS_ORIGINS to the Studio domain(s).
+# CORS. If explicit origins/regex are configured, reflect only those and allow
+# credentials. With nothing configured we fall back to a wildcard for open demo
+# use — but credentials MUST be off then, since "*" + credentials is unsafe
+# (and rejected by browsers). In production set CORS_ORIGINS to the Studio domain(s).
+_cors_configured = bool(CORS_ORIGINS or CORS_ORIGIN_REGEX)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS or ["*"],
+    allow_origins=CORS_ORIGINS if _cors_configured else ["*"],
     allow_origin_regex=CORS_ORIGIN_REGEX,
-    allow_credentials=True,
+    allow_credentials=_cors_configured,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -138,6 +144,7 @@ from .endpoints.video import router as video_router
 from .endpoints.clip import router as clip_router, demo_router as clip_demo_router
 from .endpoints.moderate import router as moderate_router
 from .endpoints.face_pose import router as face_pose_router
+from .endpoints.jobs import router as jobs_router
 
 app.include_router(classify_router)
 app.include_router(batch_router)
@@ -150,3 +157,4 @@ app.include_router(clip_router)
 app.include_router(clip_demo_router)
 app.include_router(moderate_router)
 app.include_router(face_pose_router)
+app.include_router(jobs_router)

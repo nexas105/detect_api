@@ -18,12 +18,9 @@ Without shared memory (standard multiprocessing):
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import os
 from functools import partial
-
-from PIL import Image, ImageOps
 
 logger = logging.getLogger("api.worker")
 
@@ -53,31 +50,29 @@ def _init_worker_standalone():
 
 def _run_inference(data: bytes, task: str) -> dict:
     """Run inference in worker process."""
-    from .models import ModelName, preprocess, run_detection
-    from .clip_scorer import score_sexiness
-
-    img, scale = preprocess(data)
+    from .models import ModelName, preprocess, preprocess_full, run_detection
 
     if task == "classify_nudenet":
+        img, scale = preprocess(data)
         return {"detections": run_detection(img, ModelName.nudenet, scale)}
 
     elif task == "classify_erax":
+        img, scale = preprocess(data)
         return {"detections": run_detection(img, ModelName.erax, scale)}
 
     elif task == "rateme":
-        nudenet_dets = run_detection(img, ModelName.nudenet, scale)
-        erax_dets = run_detection(img, ModelName.erax, scale)
+        from .clip_scorer import full_analysis
 
-        full_img = Image.open(io.BytesIO(data))
-        full_img = ImageOps.exif_transpose(full_img)
-        if full_img.mode != "RGB":
-            full_img = full_img.convert("RGB")
-        clip_result = score_sexiness(full_img)
+        # One decode → detection-sized + full-res image (no second Image.open).
+        detect_img, scale, full_img = preprocess_full(data)
+        nudenet_dets = run_detection(detect_img, ModelName.nudenet, scale)
+        erax_dets = run_detection(detect_img, ModelName.erax, scale)
+        clip_analysis = full_analysis(full_img)
 
         return {
             "nudenet_detections": nudenet_dets,
             "erax_detections": erax_dets,
-            "clip": clip_result,
+            "clip_analysis": clip_analysis,
         }
 
     return {"error": f"Unknown task: {task}"}

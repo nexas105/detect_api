@@ -1,0 +1,46 @@
+.frame {
+  position: relative;
+}
+
+.corner {
+  position: absolute;
+  width: var(--df-size, 10px);
+  height: var(--df-size, 10px);
+  border: 0 solid var(--df-color, var(--accent));
+  pointer-events: none;
+  opacity: var(--df-opacity, 1);
+  transition: opacity 120ms ease;
+}
+
+.tl {
+  top: var(--df-inset, -3px);
+  left: var(--df-inset, -3px);
+  border-top-width: var(--df-weight, 1.5px);
+  border-left-width: var(--df-weight, 1.5px);
+  border-top-left-radius: 3px;
+}
+.tr {
+  top: var(--df-inset, -3px);
+  right: var(--df-inset, -3px);
+  border-top-width: var(--df-weight, 1.5px);
+  border-right-width: var(--df-weight, 1.5px);
+  border-top-right-radius: 3px;
+}
+.bl {
+  bottom: var(--df-inset, -3px);
+  left: var(--df-inset, -3px);
+  border-bottom-width: var(--df-weight, 1.5px);
+  border-left-width: var(--df-weight, 1.5px);
+  border-bottom-left-radius: 3px;
+}
+.br {
+  bottom: var(--df-inset, -3px);
+  right: var(--df-inset, -3px);
+  border-bottom-width: var(--df-weight, 1.5px);
+  border-right-width: var(--df-weight, 1.5px);
+  border-bottom-right-radius: 3px;
+}
+
+.hidden {
+  opacity: 0;
+}

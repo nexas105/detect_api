@@ -4,20 +4,12 @@
  * to simulate what censoring would look like.
  */
 
+import { boxLineWidth, loadImage } from './detection-draw';
+
 interface Detection {
   label: string;
   score: number;
   box?: number[];
-}
-
-function loadImage(file: File): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = reject;
-    const url = URL.createObjectURL(file);
-    img.src = url;
-  });
 }
 
 export async function generateCensorPreview(
@@ -47,7 +39,7 @@ export async function generateCensorPreview(
 
     // Red border
     ctx.strokeStyle = 'rgba(220, 38, 38, 0.9)';
-    ctx.lineWidth = Math.max(2, Math.round(Math.min(imgWidth, imgHeight) / 200));
+    ctx.lineWidth = boxLineWidth(imgWidth, imgHeight);
     ctx.strokeRect(x, y, w, h);
 
     // Label text

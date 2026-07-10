@@ -61,7 +61,6 @@ def extract_frames(
         List of (timestamp_seconds, PIL.Image) tuples.
     """
     import cv2
-    import numpy as np
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         tmp.write(data)
@@ -82,11 +81,15 @@ def extract_frames(
         frame_idx = 0
 
         while max_frames <= 0 or len(frames) < max_frames:
-            ret, frame = cap.read()
-            if not ret:
+            # grab() only demuxes (cheap); retrieve() decodes. Skip discarded
+            # frames without paying the decode cost.
+            if not cap.grab():
                 break
 
             if frame_idx % frame_interval == 0:
+                ok, frame = cap.retrieve()
+                if not ok:
+                    break
                 timestamp = frame_idx / video_fps
                 # Convert BGR (OpenCV) to RGB (PIL)
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -223,7 +226,9 @@ def censor_video(
         tmp_in.write(input_data)
         input_path = tmp_in.name
 
-    output_path = tempfile.mktemp(suffix=".mp4")
+    # mkstemp avoids the mktemp race; close the fd — cv2.VideoWriter reopens by path.
+    _out_fd, output_path = tempfile.mkstemp(suffix=".mp4")
+    os.close(_out_fd)
 
     try:
         cap = cv2.VideoCapture(input_path)

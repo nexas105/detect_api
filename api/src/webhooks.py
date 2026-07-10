@@ -21,6 +21,7 @@ from typing import Any
 
 from .auth import _spawn_background, get_http_client, get_webhook_http_client
 from .config import AUTH_SERVICE_URL
+from db.src.webhook_security import validate_webhook_url
 
 logger = logging.getLogger("api.webhooks")
 
@@ -59,6 +60,11 @@ def _trigger_matches(endpoint: str, detection: dict, trigger_endpoint: str, trig
         # Otherwise treat threshold as a label name
         return any(d.get("label") == trigger_threshold for d in dets)
 
+    # Async job lifecycle events are delivered to catch-all webhooks. Existing
+    # installations therefore work without an enum/database migration.
+    if endpoint == "job":
+        return trigger_endpoint == "any"
+
     return False
 
 
@@ -66,7 +72,10 @@ async def _fetch_endpoints(api_key: str) -> tuple[str | None, list[dict]]:
     """Fetch configured webhook endpoints for this API key from the auth service."""
     try:
         client = await get_http_client()
-        resp = await client.get(f"{AUTH_SERVICE_URL}/webhooks/by-key/{api_key}")
+        resp = await client.post(
+            f"{AUTH_SERVICE_URL}/webhooks/by-key",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
         if resp.status_code != 200:
             return None, []
         data = resp.json()
@@ -104,6 +113,13 @@ async def _deliver_one(endpoint: dict, event_type: str, payload: dict) -> None:
     url = endpoint["url"]
     endpoint_id = endpoint["id"]
 
+    try:
+        await validate_webhook_url(url)
+    except ValueError as exc:
+        await _log_delivery(endpoint_id, event_type, body, None, f"blocked: {exc}", 1, False)
+        logger.warning("Blocked unsafe webhook target %s: %s", endpoint_id, exc)
+        return
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if attempt > 1:
             delay = RETRY_DELAYS_S[min(attempt - 1, len(RETRY_DELAYS_S) - 1)]
@@ -123,6 +139,9 @@ async def _deliver_one(endpoint: dict, event_type: str, payload: dict) -> None:
         succeeded = False
 
         try:
+            # Resolve again before every retry so changed DNS cannot bypass the
+            # check after a long backoff. The client never follows redirects.
+            await validate_webhook_url(url)
             # Use webhook-specific client so we don't leak X-Internal-Token
             # to third-party webhook targets.
             client = await get_webhook_http_client()
@@ -152,12 +171,24 @@ def dispatch_event_bg(api_key: str, endpoint: str, event_payload: dict) -> None:
     _spawn_background(_run_dispatch(api_key, endpoint, event_payload))
 
 
-async def _run_dispatch(api_key: str, endpoint: str, event_payload: dict) -> None:
+def dispatch_job_event_bg(api_key: str, status: str, event_payload: dict) -> None:
+    """Dispatch ``job.completed`` or ``job.failed`` using existing HMAC retries."""
+    _spawn_background(
+        _run_dispatch(api_key, "job", event_payload, event_type=f"job.{status}")
+    )
+
+
+async def _run_dispatch(
+    api_key: str,
+    endpoint: str,
+    event_payload: dict,
+    event_type: str | None = None,
+) -> None:
     try:
         tenant_id, hooks = await _fetch_endpoints(api_key)
         if not hooks:
             return
-        event_type = f"detection.{endpoint}"
+        event_type = event_type or f"detection.{endpoint}"
         for hook in hooks:
             if not _trigger_matches(endpoint, event_payload, hook.get("trigger_endpoint", "any"), hook.get("trigger_threshold", "any_detection")):
                 continue

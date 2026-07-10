@@ -1,0 +1,44 @@
+# NVIDIA CUDA GPU override for the `api` (ML inference) service.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+#   # with redis:
+#   docker compose -f docker-compose.yml -f docker-compose.redis.yml -f docker-compose.gpu.yml up --build
+#
+# Host requirements:
+#   - NVIDIA driver
+#   - nvidia-container-toolkit  (apt install nvidia-container-toolkit && systemctl restart docker)
+#
+# What this accelerates: all three models —
+#   - EraX (YOLO) and CLIP via CUDA torch,
+#   - NudeNet via onnxruntime-gpu (the build swaps onnxruntime for onnxruntime-gpu;
+#     it reuses the CUDA/cuDNN libs bundled by the CUDA torch wheel, found via the
+#     LD_LIBRARY_PATH set below).
+#
+# Optionally pin a CUDA wheel channel matching your driver, e.g.:
+#   TORCH_CUDA_INDEX=https://download.pytorch.org/whl/cu124
+#
+# Untested on CPU-only hosts by design — verify the build + first inference on a
+# real NVIDIA GPU host. If onnxruntime-gpu can't find the CUDA/cuDNN libs, check
+# that PY_SITE below matches the image's site-packages path.
+
+services:
+  api:
+    build:
+      args:
+        TORCH_VARIANT: cuda
+        TORCH_CUDA_INDEX: ${TORCH_CUDA_INDEX:-}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # onnxruntime-gpu loads libcudnn/libcublas/libcudart from the CUDA torch
+      # wheel's bundled nvidia/* packages. PY_SITE = image site-packages dir.
+      LD_LIBRARY_PATH: >-
+        /usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib:/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

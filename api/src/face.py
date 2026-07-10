@@ -5,32 +5,42 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import threading
 from functools import partial
 
-from PIL import Image, ImageFilter
+from PIL import Image
+
+from .models import blur_regions
 
 logger = logging.getLogger("api.face")
 
 _face_detector = None
 _face_loaded = False
+_face_lock = threading.Lock()
+# MediaPipe graphs are not reentrant — serialize .process() across executor threads.
+_face_process_lock = threading.Lock()
 
 
 def _load_face_detector():
     global _face_detector, _face_loaded
     if _face_loaded:
         return _face_detector
-    _face_loaded = True
-    try:
-        import mediapipe as mp
+    with _face_lock:
+        if _face_loaded:
+            return _face_detector
+        try:
+            import mediapipe as mp
 
-        _face_detector = mp.solutions.face_detection.FaceDetection(
-            model_selection=1,  # full-range model
-            min_detection_confidence=0.5,
-        )
-        logger.info("MediaPipe Face Detection loaded")
-    except Exception as e:
-        logger.warning("Face detection not available: %s", e)
-        _face_detector = None
+            _face_detector = mp.solutions.face_detection.FaceDetection(
+                model_selection=1,  # full-range model
+                min_detection_confidence=0.5,
+            )
+            logger.info("MediaPipe Face Detection loaded")
+        except Exception as e:
+            logger.warning("Face detection not available: %s", e)
+            _face_detector = None
+        finally:
+            _face_loaded = True
     return _face_detector
 
 
@@ -43,7 +53,8 @@ def detect_faces(img: Image.Image) -> list[dict]:
         return []
 
     rgb = np.array(img)
-    results = detector.process(rgb)
+    with _face_process_lock:
+        results = detector.process(rgb)
 
     faces = []
     if results.detections:
@@ -65,19 +76,10 @@ def detect_faces(img: Image.Image) -> list[dict]:
 def anonymize_image(img: Image.Image, faces: list[dict], blur_radius: int = 40) -> bytes:
     """Blur detected faces. Returns PNG bytes."""
     result = img.copy()
-    for face in faces:
-        bx, by, bw, bh = face["box"]
-        # Add padding
-        pad = max(10, int(max(bw, bh) * 0.15))
-        x1 = max(0, bx - pad)
-        y1 = max(0, by - pad)
-        x2 = min(result.width, bx + bw + pad)
-        y2 = min(result.height, by + bh + pad)
-        if x2 <= x1 or y2 <= y1:
-            continue
-        region = result.crop((x1, y1, x2, y2))
-        radius = max(blur_radius, min(region.width, region.height) // 2)
-        result.paste(region.filter(ImageFilter.GaussianBlur(radius=radius)), (x1, y1))
+    blur_regions(
+        result, [face["box"] for face in faces],
+        blur_radius=blur_radius, divisor=2, pad_min=10, pad_frac=0.15,
+    )
     buf = io.BytesIO()
     result.save(buf, format="PNG")
     return buf.getvalue()

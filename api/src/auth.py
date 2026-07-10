@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
+from collections import OrderedDict
 from threading import Lock
 
 import httpx
@@ -23,7 +25,7 @@ _bearer = HTTPBearer()
 # TTL-based in-memory cache to avoid an HTTP round-trip on every request.
 # Keys become invalid after at most _KEY_CACHE_TTL seconds upon revocation.
 
-_key_cache: dict[str, tuple[dict, float]] = {}  # raw_key -> (response_data, monotonic_ts)
+_key_cache: "OrderedDict[str, tuple[dict, float]]" = OrderedDict()  # raw_key -> (response_data, monotonic_ts)
 _key_cache_lock = Lock()
 _KEY_CACHE_TTL = 30  # seconds
 _KEY_CACHE_MAX = 1000  # max entries
@@ -45,11 +47,11 @@ def _get_cached_key(raw_key: str) -> dict | None:
 def _set_cached_key(raw_key: str, data: dict) -> None:
     """Cache a validation result."""
     with _key_cache_lock:
-        # Evict oldest if at capacity
+        # Evict oldest (insertion/refresh order) if at capacity — O(1)
         if len(_key_cache) >= _KEY_CACHE_MAX and raw_key not in _key_cache:
-            oldest_key = min(_key_cache, key=lambda k: _key_cache[k][1])
-            del _key_cache[oldest_key]
+            _key_cache.popitem(last=False)
         _key_cache[raw_key] = (data, time.monotonic())
+        _key_cache.move_to_end(raw_key)  # keep order == timestamp order for correct eviction
 
 
 def invalidate_key_cache(raw_key: str | None = None) -> None:
@@ -97,7 +99,7 @@ async def get_webhook_http_client() -> httpx.AsyncClient:
     """
     global _webhook_http_client
     if _webhook_http_client is None or _webhook_http_client.is_closed:
-        _webhook_http_client = httpx.AsyncClient(timeout=10)
+        _webhook_http_client = httpx.AsyncClient(timeout=10, follow_redirects=False)
     return _webhook_http_client
 
 
@@ -176,8 +178,10 @@ async def validate_api_key(creds: HTTPAuthorizationCredentials = Depends(_bearer
         _set_cached_key(raw_key, data)
         key_info = KeyInfo(data, raw_key)
 
-    # Enforce rate limit
-    allowed, remaining = rate_limiter.check(raw_key, key_info.rate_limit)
+    # Enforce rate limit. Use a sha256 of the key as the limiter identifier so
+    # the raw secret never lands in the Redis keyspace or any rate-limit logs.
+    rate_id = hashlib.sha256(raw_key.encode()).hexdigest()
+    allowed, remaining = await rate_limiter.check(rate_id, key_info.rate_limit)
     if not allowed:
         raise HTTPException(
             429,

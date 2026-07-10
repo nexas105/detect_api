@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -52,3 +53,9 @@ def decode_token(token: str) -> dict:
 
 def generate_api_key() -> str:
     return secrets.token_urlsafe(32)
+
+
+def hash_api_key(raw: str) -> str:
+    """sha256 of the plaintext key — the value stored in APIKey.key_hash and
+    used for all key lookups. Plaintext is never persisted."""
+    return hashlib.sha256(raw.encode()).hexdigest()

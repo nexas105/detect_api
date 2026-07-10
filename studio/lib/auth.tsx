@@ -70,6 +70,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const applyTokens = useCallback((data: { access_token: string; refresh_token: string; tenant_name?: string }) => {
+    localStorage.setItem('access_token', data.access_token);
+    localStorage.setItem('refresh_token', data.refresh_token);
+    if (data.tenant_name) {
+      localStorage.setItem('tenant_name', data.tenant_name);
+      setTenantName(data.tenant_name);
+    }
+    setToken(data.access_token);
+    setRefreshToken(data.refresh_token);
+  }, []);
+
+  // Reusable refresh: reads the refresh token from localStorage (source of truth,
+  // avoids stale closures), returns the new access token or null on failure.
+  const refreshAccessToken = useCallback(async (): Promise<string | null> => {
+    const storedRefresh = localStorage.getItem('refresh_token');
+    if (!storedRefresh) return null;
+    try {
+      const r = await fetch(`${AUTH_URL}/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: storedRefresh }),
+      });
+      if (!r.ok) return null;
+      const data = await r.json();
+      applyTokens(data);
+      return data.access_token as string;
+    } catch {
+      return null;
+    }
+  }, [applyTokens]);
+
   const login = useCallback(async (email: string, password: string) => {
     const res = await fetch(`${AUTH_URL}/login`, {
       method: 'POST',
@@ -81,23 +112,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       throw new Error(err.detail || 'Login failed');
     }
     const data = await res.json();
-    localStorage.setItem('access_token', data.access_token);
-    localStorage.setItem('refresh_token', data.refresh_token);
-    if (data.tenant_name) {
-      localStorage.setItem('tenant_name', data.tenant_name);
-      setTenantName(data.tenant_name);
-    }
-    setToken(data.access_token);
-    setRefreshToken(data.refresh_token);
+    applyTokens(data);
     const me = await fetchUser(data.access_token);
     setUser(me);
-  }, [fetchUser]);
+  }, [fetchUser, applyTokens]);
 
   const authFetch = useCallback(async (url: string, init?: RequestInit) => {
-    const headers = new Headers(init?.headers);
-    if (token) headers.set('Authorization', `Bearer ${token}`);
-    return fetch(url, { ...init, headers });
-  }, [token]);
+    const doFetch = (accessToken: string | null) => {
+      const headers = new Headers(init?.headers);
+      if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`);
+      return fetch(url, { ...init, headers });
+    };
+    let res = await doFetch(token);
+    // Access token expired mid-session: refresh once and retry (no loop).
+    // ponytail: reuses init.body (FormData/JSON string) — fine; a streamed body couldn't retry.
+    if (res.status === 401) {
+      const newToken = await refreshAccessToken();
+      if (newToken) {
+        res = await doFetch(newToken);
+      } else {
+        logout();
+      }
+    }
+    return res;
+  }, [token, refreshAccessToken, logout]);
 
   useEffect(() => {
     const stored = localStorage.getItem('access_token');
@@ -112,32 +150,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setRefreshToken(storedRefresh);
     fetchUser(stored)
       .then(setUser)
-      .catch(() => {
-        // Try refresh
-        if (storedRefresh) {
-          fetch(`${AUTH_URL}/refresh`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ refresh_token: storedRefresh }),
-          })
-            .then((r) => (r.ok ? r.json() : Promise.reject()))
-            .then((data) => {
-              localStorage.setItem('access_token', data.access_token);
-              localStorage.setItem('refresh_token', data.refresh_token);
-              if (data.tenant_name) {
-                localStorage.setItem('tenant_name', data.tenant_name);
-                setTenantName(data.tenant_name);
-              }
-              setToken(data.access_token);
-              setRefreshToken(data.refresh_token);
-              return fetchUser(data.access_token);
-            })
-            .then(setUser)
-            .catch(logout);
-        } else {
-          logout();
-        }
-      })
+      .catch(() =>
+        refreshAccessToken()
+          .then((t) => (t ? fetchUser(t) : Promise.reject()))
+          .then(setUser)
+          .catch(logout)
+      )
       .finally(() => setLoading(false));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 

@@ -6,23 +6,21 @@ Actions: "allow" | "flag" | "block" with confidence and reasons.
 
 from __future__ import annotations
 
-import asyncio
-import io
-
 from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
-from PIL import Image, ImageOps
 
 from ..auth import KeyInfo, log_usage_bg, save_detection_bg, validate_api_key
 from ..cache import get_cached, hash_image, set_cached
-from ..clip_scorer import full_analysis_async
 from ..demo import demo_limiter
+from .demo import _get_demo_key
 from ..webhooks import dispatch_event_bg
 from ..models import (
-    ModelName, get_ext, model_version_for, preprocess, run_detection_async,
+    ModelName, get_ext, model_version_for, preprocess_full,
     store_image_async, validate_upload,
 )
-from .rateme import _merge_detections, _score_eroticism, compute_rating
+from .rateme import (
+    _score_eroticism, analyze_core, cache_hit_response, persist_result,
+)
 from ..schemas import DemoModerateResponse, ModerateResponse
 
 router = APIRouter()
@@ -164,28 +162,14 @@ async def moderate(
     if not no_cache:
         cached = await get_cached(image_hash, cache_version, cache_endpoint)
         if cached is not None:
-            log_usage_bg(key_info, "/moderate", "POST", 200)
-            return JSONResponse(content=cached, headers={"X-Cache": "HIT"})
+            return await cache_hit_response(data, file.filename, key_info, "moderate", "nudenet+erax+clip", cached)
 
-    img, scale = preprocess(data)
+    img, scale, full_img = preprocess_full(data)
 
-    # Full-res image for CLIP + rating quality analysis
-    full_img = Image.open(io.BytesIO(data))
-    full_img = ImageOps.exif_transpose(full_img)
-    if full_img.mode != "RGB":
-        full_img = full_img.convert("RGB")
-
-    # Run all analyses in parallel
-    nudenet_dets, erax_dets, clip_analysis = await asyncio.gather(
-        run_detection_async(img, ModelName.nudenet, scale),
-        run_detection_async(img, ModelName.erax, scale),
-        full_analysis_async(full_img),
-    )
-
-    detections = _merge_detections(nudenet_dets, erax_dets)
-
-    # Compute rating (reuses merged detections + CLIP internally via compute_rating)
-    rating = await compute_rating(detections, full_img)
+    core = await analyze_core(image_hash, img, full_img, scale, no_cache)
+    detections = core["detections"]
+    clip_analysis = core["clip_analysis"]
+    rating = core["rating"]
 
     # Determine action
     action, confidence, reasons = _determine_action(rating, clip_analysis, detections)
@@ -193,13 +177,7 @@ async def moderate(
     # Nudity score
     nudity_score = _compute_nudity_score(detections)
 
-    # Store image + log
-    image_id, orig_path = await store_image_async(data, get_ext(file.filename), "originals")
-    log_usage_bg(key_info, "/moderate", "POST", 200)
-    save_detection_bg(
-        key_info, image_id, "moderate", "nudenet+erax+clip",
-        detections, original_path=orig_path,
-    )
+    image_id = await persist_result(data, file.filename, key_info, "moderate", "nudenet+erax+clip", detections)
 
     result = {
         "image_id": image_id,
@@ -222,7 +200,10 @@ async def moderate(
     }
 
     if not no_cache:
-        await set_cached(image_hash, cache_version, cache_endpoint, result)
+        await set_cached(
+            image_hash, cache_version, cache_endpoint,
+            {k: v for k, v in result.items() if k != "image_id"},
+        )
 
     dispatch_event_bg(key_info.raw_key, "moderate", {**result, "image_hash": image_hash})
 
@@ -240,52 +221,30 @@ async def demo_moderate(
     (10 images/hour) and a 10MB file size cap. Results are stored under
     the demo system account.
     """
-    from ..auth import get_http_client, KeyInfo, log_usage_bg, save_detection_bg
-    from ..config import AUTH_SERVICE_URL
-
-    demo_limiter.check_image(request)
+    await demo_limiter.check_image(request)
     data = await file.read()
     validate_upload(data, max_size=10 * 1024 * 1024)
 
-    img, scale = preprocess(data)
+    image_hash = hash_image(data)
+    img, scale, full_img = preprocess_full(data)
 
-    # Full-res image for CLIP + rating
-    full_img = Image.open(io.BytesIO(data))
-    full_img = ImageOps.exif_transpose(full_img)
-    if full_img.mode != "RGB":
-        full_img = full_img.convert("RGB")
-
-    # Run all analyses in parallel
-    nudenet_dets, erax_dets, clip_analysis = await asyncio.gather(
-        run_detection_async(img, ModelName.nudenet, scale),
-        run_detection_async(img, ModelName.erax, scale),
-        full_analysis_async(full_img),
-    )
-
-    detections = _merge_detections(nudenet_dets, erax_dets)
-    rating = await compute_rating(detections, full_img)
+    core = await analyze_core(image_hash, img, full_img, scale)
+    detections = core["detections"]
+    clip_analysis = core["clip_analysis"]
+    rating = core["rating"]
 
     action, confidence, reasons = _determine_action(rating, clip_analysis, detections)
     nudity_score = _compute_nudity_score(detections)
 
-    # Store under demo account
+    # Store under demo account — best-effort, never fails the response.
     try:
-        client = await get_http_client()
-        resp = await client.get(f"{AUTH_SERVICE_URL}/demo/key")
-        if resp.status_code == 200:
-            raw_key = resp.json()["key"]
-            resp2 = await client.post(
-                f"{AUTH_SERVICE_URL}/validate-key",
-                headers={"Authorization": f"Bearer {raw_key}"},
-            )
-            if resp2.status_code == 200:
-                key_info = KeyInfo(resp2.json(), raw_key)
-                image_id, orig_path = await store_image_async(data, get_ext(file.filename), "originals")
-                log_usage_bg(key_info, "/demo/moderate", "POST", 200)
-                save_detection_bg(
-                    key_info, image_id, "demo-moderate", "nudenet+erax+clip",
-                    detections, original_path=orig_path,
-                )
+        key_info = await _get_demo_key()
+        image_id, orig_path = await store_image_async(data, get_ext(file.filename), "originals")
+        log_usage_bg(key_info, "/demo/moderate", "POST", 200)
+        save_detection_bg(
+            key_info, image_id, "demo-moderate", "nudenet+erax+clip",
+            detections, original_path=orig_path,
+        )
     except Exception:
         pass  # non-critical
 
@@ -307,5 +266,5 @@ async def demo_moderate(
             "text_flags": [],
         },
         "demo": True,
-        "limits": demo_limiter.get_remaining(request),
+        "limits": await demo_limiter.get_remaining(request),
     }

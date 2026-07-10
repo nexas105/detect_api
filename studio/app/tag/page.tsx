@@ -8,10 +8,8 @@ import {
   Group,
   Paper,
   Progress,
-  Select,
   Stack,
   Text,
-  TextInput,
   Textarea,
 } from '@mantine/core';
 import { IconAlertCircle, IconFileUpload, IconTag, IconUpload } from '@tabler/icons-react';
@@ -20,6 +18,7 @@ import { DashboardShell } from '@/components/DashboardShell/DashboardShell';
 import { PageHeader } from '@/components/PageHeader/PageHeader';
 import { API_URL } from '@/lib/auth';
 import { useApiKeys } from '@/lib/use-api-keys';
+import { ApiKeySelect } from '@/components/ApiKeySelect';
 
 const ACCEPTED_IMAGE = '.jpg,.jpeg,.png,.webp';
 
@@ -78,27 +77,15 @@ export default function TagPage() {
       <Paper withBorder p="lg" radius="md" mb="xl">
         <Stack>
           {/* API Key selection */}
-          <Paper withBorder p="sm" radius="md">
-            <Text size="sm" fw={500} mb={4}>
-              {t('apiKey')} <Text span c="red">*</Text>
-            </Text>
-            <Select
-              placeholder={t('selectKey')}
-              data={keys.map((k) => ({
-                value: k.id,
-                label: `${k.name}${k.is_master ? ' [master]' : ''} — ${k.is_own && !k.key.endsWith('...') ? 'ready' : k.key}`,
-              }))}
-              value={selectedKeyId}
-              onChange={selectKey}
-              clearable
-              mb="xs"
-            />
-            <TextInput
-              placeholder="Paste your full API key (ehk_...)"
-              value={selectedKey}
-              onChange={(e) => setSelectedKey(e.currentTarget.value)}
-            />
-          </Paper>
+          <ApiKeySelect
+            keys={keys}
+            selectedKey={selectedKey}
+            setSelectedKey={setSelectedKey}
+            selectedKeyId={selectedKeyId}
+            selectKey={selectKey}
+            label={t('apiKey')}
+            placeholder={t('selectKey')}
+          />
 
           {/* File picker */}
           <div>

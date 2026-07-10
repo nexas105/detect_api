@@ -17,18 +17,18 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from . import redis_backend
 from .config import CACHE_ENABLED, CACHE_TTL_SECONDS
 
 logger = logging.getLogger("api.cache")
 
-REDIS_URL = os.getenv("REDIS_URL", "")
-_redis = None
-_redis_available = False
-_redis_init_attempted = False
+# Endpoint tag for the shared (endpoint-agnostic) detection cache. The expensive
+# CLIP + NudeNet/EraX result is stored under this so classify/rateme/moderate
+# all hit the same entry (see get_shared_detection / set_shared_detection).
+_SHARED_ENDPOINT = "_shared"
 
 
 # ── Hashing ─────────────────────────────────────────────────────────────────
@@ -39,42 +39,7 @@ def hash_image(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-# ── Redis connection ────────────────────────────────────────────────────────
-
-
-def _init_redis() -> None:
-    global _redis, _redis_available, _redis_init_attempted
-    _redis_init_attempted = True
-    if not REDIS_URL:
-        logger.info("Cache: no REDIS_URL — DB fallback only")
-        return
-    try:
-        import redis
-        _redis = redis.from_url(REDIS_URL, decode_responses=True)
-        _redis.ping()
-        _redis_available = True
-        logger.info("Cache: Redis connected (%s)", REDIS_URL)
-    except Exception as e:
-        logger.warning("Cache: Redis unavailable (%s) — DB fallback", e)
-        _redis = None
-        _redis_available = False
-
-
-def _try_redis():
-    """Return Redis client if reachable, else None. Lazy-init on first use."""
-    global _redis, _redis_available
-    if not _redis_init_attempted:
-        _init_redis()
-    if not REDIS_URL:
-        return None
-    if _redis_available and _redis:
-        try:
-            _redis.ping()
-            return _redis
-        except Exception:
-            logger.warning("Cache: Redis connection lost, falling back to DB")
-            _redis_available = False
-    return None
+# ── Redis key ───────────────────────────────────────────────────────────────
 
 
 def _redis_key(image_hash: str, model_version: str, endpoint: str) -> str:
@@ -94,14 +59,16 @@ async def get_cached(
         return None
 
     # Redis
-    r = _try_redis()
+    r = redis_backend.get_redis()
     if r:
         try:
-            raw = r.get(_redis_key(image_hash, model_version, endpoint))
+            raw = await r.get(_redis_key(image_hash, model_version, endpoint))
             if raw:
                 return json.loads(raw)
         except Exception as e:
             logger.warning("Cache: Redis GET failed: %s", e)
+            redis_backend.reset()
+            r = None
 
     # DB fallback
     try:
@@ -126,13 +93,13 @@ async def get_cached(
             # Warm Redis on DB hit
             if r:
                 try:
-                    r.setex(
+                    await r.setex(
                         _redis_key(image_hash, model_version, endpoint),
                         CACHE_TTL_SECONDS,
                         row.result_json,
                     )
                 except Exception:
-                    pass
+                    redis_backend.reset()
             return result
     except Exception as e:
         logger.warning("Cache: DB GET failed: %s", e)
@@ -156,12 +123,13 @@ async def set_cached(
         return
 
     # Redis
-    r = _try_redis()
+    r = redis_backend.get_redis()
     if r:
         try:
-            r.setex(_redis_key(image_hash, model_version, endpoint), CACHE_TTL_SECONDS, payload)
+            await r.setex(_redis_key(image_hash, model_version, endpoint), CACHE_TTL_SECONDS, payload)
         except Exception as e:
             logger.warning("Cache: Redis SET failed: %s", e)
+            redis_backend.reset()
 
     # DB
     try:
@@ -194,3 +162,27 @@ async def set_cached(
                 await session.rollback()  # concurrent insert — accept
     except Exception as e:
         logger.warning("Cache: DB SET failed: %s", e)
+
+
+# ── Shared detection cache (endpoint-agnostic) ───────────────────────────────
+# The expensive inference (CLIP analysis + NudeNet/EraX detections) is keyed on
+# sha256(image)+model_version ONLY, so classify/rateme/moderate share one entry.
+# Endpoint-specific final responses can still use get_cached/set_cached with a
+# real endpoint tag if they need to.
+
+
+async def get_shared_detection(
+    image_hash: str,
+    model_version: str,
+) -> Optional[dict[str, Any]]:
+    """Return the shared (endpoint-agnostic) detection dict, or None."""
+    return await get_cached(image_hash, model_version, _SHARED_ENDPOINT)
+
+
+async def set_shared_detection(
+    image_hash: str,
+    model_version: str,
+    detection: dict[str, Any],
+) -> None:
+    """Store the shared (endpoint-agnostic) detection dict."""
+    await set_cached(image_hash, model_version, _SHARED_ENDPOINT, detection)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from functools import partial
 
 from PIL import Image
@@ -12,6 +13,9 @@ logger = logging.getLogger("api.pose")
 
 _pose_estimator = None
 _pose_loaded = False
+_pose_lock = threading.Lock()
+# MediaPipe graphs are not reentrant — serialize .process() across executor threads.
+_pose_process_lock = threading.Lock()
 
 POSE_LANDMARKS = [
     "nose", "left_eye_inner", "left_eye", "left_eye_outer",
@@ -30,19 +34,23 @@ def _load_pose():
     global _pose_estimator, _pose_loaded
     if _pose_loaded:
         return _pose_estimator
-    _pose_loaded = True
-    try:
-        import mediapipe as mp
+    with _pose_lock:
+        if _pose_loaded:
+            return _pose_estimator
+        try:
+            import mediapipe as mp
 
-        _pose_estimator = mp.solutions.pose.Pose(
-            static_image_mode=True,
-            model_complexity=1,
-            min_detection_confidence=0.5,
-        )
-        logger.info("MediaPipe Pose loaded")
-    except Exception as e:
-        logger.warning("Pose estimation not available: %s", e)
-        _pose_estimator = None
+            _pose_estimator = mp.solutions.pose.Pose(
+                static_image_mode=True,
+                model_complexity=1,
+                min_detection_confidence=0.5,
+            )
+            logger.info("MediaPipe Pose loaded")
+        except Exception as e:
+            logger.warning("Pose estimation not available: %s", e)
+            _pose_estimator = None
+        finally:
+            _pose_loaded = True
     return _pose_estimator
 
 
@@ -55,7 +63,8 @@ def estimate_pose(img: Image.Image) -> dict:
         return {"available": False, "keypoints": [], "analysis": {}}
 
     rgb = np.array(img)
-    results = estimator.process(rgb)
+    with _pose_process_lock:
+        results = estimator.process(rgb)
 
     if not results.pose_landmarks:
         return {"available": True, "detected": False, "keypoints": [], "analysis": {"body_detected": False}}

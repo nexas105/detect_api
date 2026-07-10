@@ -17,13 +17,12 @@ import {
   IconClock,
   IconStack2,
 } from '@tabler/icons-react';
-import { useCallback, useEffect, useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { DashboardShell } from '@/components/DashboardShell/DashboardShell';
 import { PageHeader } from '@/components/PageHeader/PageHeader';
 import { EmptyState } from '@/components/EmptyState/EmptyState';
 import { SkeletonList } from '@/components/SkeletonList/SkeletonList';
-import { AUTH_URL, useAuth } from '@/lib/auth';
+import { useAuthQuery } from '@/lib/use-auth-query';
 
 interface KeyUsage {
   name: string;
@@ -39,26 +38,9 @@ interface UsageStats {
 }
 
 export default function UsagePage() {
-  const { authFetch } = useAuth();
   const t = useTranslations('usage');
   const tCommon = useTranslations('common');
-  const [stats, setStats] = useState<UsageStats | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  const fetchStats = useCallback(async () => {
-    try {
-      const res = await authFetch(`${AUTH_URL}/usage/stats`);
-      if (res.ok) {
-        setStats(await res.json());
-      }
-    } finally {
-      setLoading(false);
-    }
-  }, [authFetch]);
-
-  useEffect(() => {
-    fetchStats();
-  }, [fetchStats]);
+  const { data: stats, isLoading: loading } = useAuthQuery<UsageStats>('/usage/stats');
 
   if (loading) {
     return (
@@ -111,7 +93,7 @@ export default function UsagePage() {
                 <Text c="dimmed" tt="uppercase" fw={700} fz="xs">
                   {stat.label}
                 </Text>
-                <Text fw={700} fz="xl" mt={4}>
+                <Text className="data-mono" fw={700} fz="xl" mt={4}>
                   {stat.value}
                 </Text>
               </div>
@@ -150,7 +132,7 @@ export default function UsagePage() {
                       )}
                     </Table.Td>
                     <Table.Td>
-                      <Text fw={500}>{k.requests_24h.toLocaleString()}</Text>
+                      <Text className="data-mono" fw={500}>{k.requests_24h.toLocaleString()}</Text>
                     </Table.Td>
                   </Table.Tr>
                 ))}
@@ -169,7 +151,7 @@ export default function UsagePage() {
                   )}
                 </Group>
                 <Text size="sm" c="dimmed">
-                  {t('requestsLast24h')}: <Text span fw={500} c="inherit">{k.requests_24h.toLocaleString()}</Text>
+                  {t('requestsLast24h')}: <Text span className="data-mono" fw={500} c="inherit">{k.requests_24h.toLocaleString()}</Text>
                 </Text>
               </Paper>
             ))}
